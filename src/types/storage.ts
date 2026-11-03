@@ -33,7 +33,9 @@ export interface NoteDocument {
   baseRevisionId?: string;
   baseDriveVersion?: number;
   clientTimestamp: number;
+  clientDeviceId?: string;
   driveFileId?: string;
+  duplicateDriveFileIds?: string[];
   isDeleted: boolean;
   deletedAt?: string;
 }
@@ -55,6 +57,7 @@ export interface NoteHeader {
   contentHash: string;
   driveFileId?: string;
   driveVersion?: number;
+  duplicateDriveFileIds?: string[];
   updatedAt: string;
   isDeleted: boolean;
   deletedAt?: string;
@@ -70,6 +73,7 @@ export interface ApplicationManifest {
   revisionSequence: number;
   notes: Record<string, NoteHeader>;
   branches: BranchRecord[];
+  duplicateManifestFileIds?: string[];
 }
 
 export type SyncJobType = 'SAVE_NOTE' | 'SAVE_MANIFEST' | 'DELETE_NOTE';
@@ -93,6 +97,7 @@ export type PersistenceState =
   | 'SYNCING'
   | 'COMMITTED_REMOTE'
   | 'OFFLINE'
+  | 'AUTH_REQUIRED'
   | 'CONFLICT_DIVERGED'
   | 'ERROR';
 
@@ -100,14 +105,21 @@ export interface DriveFolderInfo {
   rootFolderId: string;
   notesFolderId: string;
   manifestFileId?: string;
+  duplicateManifestFileIds?: string[];
+}
+
+export interface DuplicateFileRecord {
+  fileId: string;
+  version?: number;
+  modifiedTime?: string;
 }
 
 export interface IStorageAdapter {
   discoverOrCreateAppFolders(): Promise<DriveFolderInfo>;
   getManifest(folderInfo: DriveFolderInfo): Promise<{ manifest: ApplicationManifest; version?: number } | null>;
   saveManifest(folderInfo: DriveFolderInfo, manifest: ApplicationManifest, baseVersion?: number): Promise<{ fileId: string; version: number }>;
-  getNote(noteId: string, folderInfo: DriveFolderInfo): Promise<{ note: NoteDocument; version?: number } | null>;
+  getNote(noteId: string, folderInfo: DriveFolderInfo, driveFileId?: string): Promise<{ note: NoteDocument; version?: number; duplicates?: DuplicateFileRecord[] } | null>;
   saveNote(note: NoteDocument, folderInfo: DriveFolderInfo): Promise<{ fileId: string; version: number; contentHash: string }>;
-  listDriveNotes(folderInfo: DriveFolderInfo): Promise<{ fileId: string; name: string; appProperties?: Record<string, string>; version?: number }[]>;
+  listDriveNotes(folderInfo: DriveFolderInfo): Promise<{ fileId: string; name: string; appProperties?: Record<string, string>; version?: number; modifiedTime?: string }[]>;
   deleteNoteFile(fileId: string): Promise<void>;
 }

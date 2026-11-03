@@ -130,5 +130,11 @@ describe('Sync Engine & Write-Ahead Offline Persistence', () => {
 
     expect(conflictCopy).toBeDefined();
     expect(conflictCopy?.content.content[0].text).toBe('Device A Local Text');
+
+    // 7. Verify the local original note was rebased onto canonical remote note
+    const localOriginal = localNotes.find(n => n.id === 'note_concurrent');
+    expect(localOriginal).toBeDefined();
+    expect(localOriginal?.content.content[0].text).toBe('Device B Text');
+    expect(localOriginal?.baseDriveVersion).toBe(2);
   });
 });

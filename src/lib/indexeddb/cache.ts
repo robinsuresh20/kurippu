@@ -91,9 +91,60 @@ export async function getManifestLocal(): Promise<ApplicationManifest | undefine
   return db.get('manifest', 'current');
 }
 
-export async function enqueueSyncJob(job: Omit<SyncJob, 'id'>): Promise<number> {
+/**
+ * Enqueues a sync job, coalescing pending jobs for the same targetId and type.
+ * If a pending job already exists, its payload and timestamp are updated in-place.
+ */
+export async function enqueueOrCoalesceSyncJob(job: Omit<SyncJob, 'id'>): Promise<number> {
   const db = await getLocalDB();
-  return db.add('sync_queue', job as SyncJob);
+  const tx = db.transaction('sync_queue', 'readwrite');
+  const index = tx.store.index('by_status');
+  let cursor = await index.openCursor('pending');
+  let existingId: number | null = null;
+
+  while (cursor) {
+    if (cursor.value.targetId === job.targetId && cursor.value.type === job.type) {
+      existingId = cursor.value.id!;
+      const updatedJob: SyncJob = {
+        ...cursor.value,
+        payload: job.payload,
+        clientTimestamp: job.clientTimestamp,
+        retryCount: 0,
+      };
+      await cursor.update(updatedJob);
+      break;
+    }
+    cursor = await cursor.continue();
+  }
+
+  if (existingId !== null) {
+    await tx.done;
+    return existingId;
+  }
+
+  const id = await tx.store.add(job as SyncJob);
+  await tx.done;
+  return id;
+}
+
+export async function enqueueSyncJob(job: Omit<SyncJob, 'id'>): Promise<number> {
+  return enqueueOrCoalesceSyncJob(job);
+}
+
+export async function hasPendingJobForNote(noteId: string): Promise<boolean> {
+  const db = await getLocalDB();
+  const tx = db.transaction('sync_queue', 'readonly');
+  const index = tx.store.index('by_status');
+  for (const status of ['pending', 'processing']) {
+    let cursor = await index.openCursor(status as any);
+    while (cursor) {
+      if (cursor.value.targetId === noteId) {
+        return true;
+      }
+      cursor = await cursor.continue();
+    }
+  }
+  return false;
 }
 
 export async function peekNextPendingJob(): Promise<SyncJob | undefined> {
@@ -112,6 +163,20 @@ export async function updateSyncJob(job: SyncJob): Promise<void> {
 export async function removeSyncJob(id: number): Promise<void> {
   const db = await getLocalDB();
   await db.delete('sync_queue', id);
+}
+
+export async function removePendingJobsForNote(noteId: string): Promise<void> {
+  const db = await getLocalDB();
+  const tx = db.transaction('sync_queue', 'readwrite');
+  const index = tx.store.index('by_status');
+  let cursor = await index.openCursor('pending');
+  while (cursor) {
+    if (cursor.value.targetId === noteId) {
+      await cursor.delete();
+    }
+    cursor = await cursor.continue();
+  }
+  await tx.done;
 }
 
 export async function getPendingJobCount(): Promise<number> {

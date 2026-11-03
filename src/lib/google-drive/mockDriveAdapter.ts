@@ -1,4 +1,4 @@
-import { IStorageAdapter, DriveFolderInfo, ApplicationManifest, NoteDocument } from '../../types/storage';
+import { IStorageAdapter, DriveFolderInfo, ApplicationManifest, NoteDocument, DuplicateFileRecord } from '../../types/storage';
 import { computeContentHash } from '../storage/hash';
 
 export interface MockFile {
@@ -10,6 +10,7 @@ export interface MockFile {
   version: number;
   appProperties: Record<string, string>;
   trashed: boolean;
+  modifiedTime?: string;
 }
 
 export class MockDriveAdapter implements IStorageAdapter {
@@ -52,9 +53,11 @@ export class MockDriveAdapter implements IStorageAdapter {
   async discoverOrCreateAppFolders(): Promise<DriveFolderInfo> {
     this.checkNetwork();
 
-    let root = Array.from(this.files.values()).find(
-      f => f.appProperties['kurippuRole'] === 'root' && !f.trashed
-    );
+    const rootFiles = Array.from(this.files.values())
+      .filter(f => (f.appProperties['kurippuRole'] === 'root' || f.name === 'Kurippu Knowledge Base') && !f.trashed)
+      .sort((a, b) => (b.version || 0) - (a.version || 0));
+
+    let root = rootFiles[0];
 
     if (!root) {
       const rootId = this.generateId('folder_root_');
@@ -67,13 +70,16 @@ export class MockDriveAdapter implements IStorageAdapter {
         version: 1,
         appProperties: { kurippuApp: 'true', kurippuRole: 'root' },
         trashed: false,
+        modifiedTime: new Date().toISOString(),
       };
       this.files.set(rootId, root);
     }
 
-    let notes = Array.from(this.files.values()).find(
-      f => f.parents.includes(root!.id) && f.appProperties['kurippuRole'] === 'notesFolder' && !f.trashed
-    );
+    const notesFiles = Array.from(this.files.values())
+      .filter(f => f.parents.includes(root!.id) && (f.appProperties['kurippuRole'] === 'notesFolder' || f.name === 'notes') && !f.trashed)
+      .sort((a, b) => (b.version || 0) - (a.version || 0));
+
+    let notes = notesFiles[0];
 
     if (!notes) {
       const notesId = this.generateId('folder_notes_');
@@ -86,30 +92,49 @@ export class MockDriveAdapter implements IStorageAdapter {
         version: 1,
         appProperties: { kurippuApp: 'true', kurippuRole: 'notesFolder' },
         trashed: false,
+        modifiedTime: new Date().toISOString(),
       };
       this.files.set(notesId, notes);
     }
 
-    const manifest = Array.from(this.files.values()).find(
-      f => f.parents.includes(root!.id) && f.appProperties['kurippuRole'] === 'manifest' && !f.trashed
-    );
+    const manifestFiles = Array.from(this.files.values())
+      .filter(f => f.parents.includes(root!.id) && (f.appProperties['kurippuRole'] === 'manifest' || f.name === 'manifest.json') && !f.trashed)
+      .sort((a, b) => (b.version || 0) - (a.version || 0));
+
+    const manifest = manifestFiles[0];
+    const duplicateManifestFileIds = manifestFiles.length > 1 ? manifestFiles.slice(1).map(f => f.id) : undefined;
 
     return {
       rootFolderId: root.id,
       notesFolderId: notes.id,
       manifestFileId: manifest?.id,
+      duplicateManifestFileIds,
     };
   }
 
   async getManifest(folderInfo: DriveFolderInfo): Promise<{ manifest: ApplicationManifest; version?: number } | null> {
     this.checkNetwork();
 
+    if (!folderInfo.manifestFileId) {
+      const manifest = Array.from(this.files.values()).find(
+        f => f.parents.includes(folderInfo.rootFolderId) && (f.appProperties['kurippuRole'] === 'manifest' || f.name === 'manifest.json') && !f.trashed
+      );
+      if (manifest) {
+        folderInfo.manifestFileId = manifest.id;
+      }
+    }
+
     if (!folderInfo.manifestFileId) return null;
     const file = this.files.get(folderInfo.manifestFileId);
     if (!file || file.trashed) return null;
 
+    const manifest: ApplicationManifest = JSON.parse(file.content);
+    if (folderInfo.duplicateManifestFileIds && folderInfo.duplicateManifestFileIds.length > 0) {
+      manifest.duplicateManifestFileIds = folderInfo.duplicateManifestFileIds;
+    }
+
     return {
-      manifest: JSON.parse(file.content),
+      manifest,
       version: file.version,
     };
   }
@@ -117,11 +142,26 @@ export class MockDriveAdapter implements IStorageAdapter {
   async saveManifest(folderInfo: DriveFolderInfo, manifest: ApplicationManifest): Promise<{ fileId: string; version: number }> {
     this.checkNetwork();
 
+    if (folderInfo.duplicateManifestFileIds && (!manifest.duplicateManifestFileIds || manifest.duplicateManifestFileIds.length === 0)) {
+      manifest.duplicateManifestFileIds = folderInfo.duplicateManifestFileIds;
+    }
+
     let file: MockFile | undefined;
     if (folderInfo.manifestFileId && this.files.has(folderInfo.manifestFileId)) {
       file = this.files.get(folderInfo.manifestFileId)!;
+    } else {
+      // Search if manifest already exists in rootFolderId, selecting newest by version
+      const existingManifests = Array.from(this.files.values())
+        .filter(f => f.parents.includes(folderInfo.rootFolderId) && f.appProperties['kurippuRole'] === 'manifest' && !f.trashed)
+        .sort((a, b) => (b.version || 0) - (a.version || 0));
+      file = existingManifests[0];
+    }
+
+    if (file) {
       file.content = JSON.stringify(manifest);
       file.version += 1;
+      file.modifiedTime = new Date().toISOString();
+      folderInfo.manifestFileId = file.id;
     } else {
       const id = this.generateId('file_manifest_');
       file = {
@@ -133,6 +173,7 @@ export class MockDriveAdapter implements IStorageAdapter {
         version: 1,
         appProperties: { kurippuApp: 'true', kurippuRole: 'manifest' },
         trashed: false,
+        modifiedTime: new Date().toISOString(),
       };
       this.files.set(id, file);
       folderInfo.manifestFileId = id;
@@ -141,17 +182,49 @@ export class MockDriveAdapter implements IStorageAdapter {
     return { fileId: file.id, version: file.version };
   }
 
-  async getNote(noteId: string, folderInfo: DriveFolderInfo): Promise<{ note: NoteDocument; version?: number } | null> {
+  async getNote(
+    noteId: string,
+    folderInfo: DriveFolderInfo,
+    driveFileId?: string
+  ): Promise<{ note: NoteDocument; version?: number; duplicates?: DuplicateFileRecord[] } | null> {
     this.checkNetwork();
 
-    const file = Array.from(this.files.values()).find(
-      f => f.parents.includes(folderInfo.notesFolderId) && f.appProperties['kurippuNoteId'] === noteId && !f.trashed
-    );
-    if (!file) return null;
+    let canonical: MockFile | undefined;
+    let duplicates: DuplicateFileRecord[] = [];
 
-    const note = JSON.parse(file.content) as NoteDocument;
-    note.driveFileId = file.id;
-    return { note, version: file.version };
+    if (driveFileId && this.files.has(driveFileId)) {
+      const file = this.files.get(driveFileId)!;
+      if (!file.trashed) {
+        canonical = file;
+      }
+    }
+
+    if (!canonical) {
+      const matchingFiles = Array.from(this.files.values())
+        .filter(f => f.parents.includes(folderInfo.notesFolderId) && f.appProperties['kurippuNoteId'] === noteId && !f.trashed)
+        .sort((a, b) => (b.version || 0) - (a.version || 0));
+
+      if (matchingFiles.length === 0) return null;
+
+      canonical = matchingFiles[0];
+      duplicates = matchingFiles.slice(1).map(f => ({
+        fileId: f.id,
+        version: f.version,
+        modifiedTime: f.modifiedTime,
+      }));
+    }
+
+    const note = JSON.parse(canonical.content) as NoteDocument;
+    note.driveFileId = canonical.id;
+    if (duplicates.length > 0) {
+      note.duplicateDriveFileIds = duplicates.map(d => d.fileId);
+    }
+
+    return {
+      note,
+      version: canonical.version,
+      duplicates: duplicates.length > 0 ? duplicates : undefined,
+    };
   }
 
   async saveNote(note: NoteDocument, folderInfo: DriveFolderInfo): Promise<{ fileId: string; version: number; contentHash: string }> {
@@ -160,13 +233,23 @@ export class MockDriveAdapter implements IStorageAdapter {
     const hash = note.contentHash || (await computeContentHash(note.content));
     const payload = { ...note, contentHash: hash };
 
-    let file = Array.from(this.files.values()).find(
-      f => f.parents.includes(folderInfo.notesFolderId) && f.appProperties['kurippuNoteId'] === note.id && !f.trashed
-    );
+    // Find file by note.driveFileId first, or by appProperties.kurippuNoteId
+    let file = note.driveFileId ? this.files.get(note.driveFileId) : undefined;
+    if (!file) {
+      const matching = Array.from(this.files.values())
+        .filter(f => f.parents.includes(folderInfo.notesFolderId) && f.appProperties['kurippuNoteId'] === note.id && !f.trashed)
+        .sort((a, b) => (b.version || 0) - (a.version || 0));
+      file = matching[0];
+      if (matching.length > 1) {
+        note.duplicateDriveFileIds = matching.slice(1).map(f => f.id);
+      }
+    }
 
     if (file) {
       file.content = JSON.stringify(payload);
       file.version += 1;
+      file.modifiedTime = new Date().toISOString();
+      note.driveFileId = file.id;
     } else {
       const id = this.generateId(`file_note_${note.id}_`);
       file = {
@@ -178,15 +261,23 @@ export class MockDriveAdapter implements IStorageAdapter {
         version: 1,
         appProperties: { kurippuApp: 'true', kurippuRole: 'note', kurippuNoteId: note.id },
         trashed: false,
+        modifiedTime: new Date().toISOString(),
       };
       this.files.set(id, file);
+      note.driveFileId = id;
     }
 
     return { fileId: file.id, version: file.version, contentHash: hash };
   }
 
-  async listDriveNotes(folderInfo: DriveFolderInfo): Promise<{ fileId: string; name: string; appProperties?: Record<string, string>; version?: number }[]> {
+  async listDriveNotes(
+    folderInfo: DriveFolderInfo
+  ): Promise<{ fileId: string; name: string; appProperties?: Record<string, string>; version?: number; modifiedTime?: string }[]> {
     this.checkNetwork();
+
+    if (!folderInfo?.notesFolderId || !folderInfo.notesFolderId.trim()) {
+      throw new Error('Cannot list Drive notes: notesFolderId is missing or uninitialized.');
+    }
 
     return Array.from(this.files.values())
       .filter(f => f.parents.includes(folderInfo.notesFolderId) && f.appProperties['kurippuRole'] === 'note' && !f.trashed)
@@ -195,6 +286,7 @@ export class MockDriveAdapter implements IStorageAdapter {
         name: f.name,
         appProperties: f.appProperties,
         version: f.version,
+        modifiedTime: f.modifiedTime,
       }));
   }
 
