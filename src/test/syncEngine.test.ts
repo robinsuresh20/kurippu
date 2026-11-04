@@ -7,6 +7,7 @@ import {
   enqueueSyncJob,
   getPendingJobCount,
   listNotesLocal,
+  setActiveAccount,
 } from '../lib/indexeddb/cache';
 import { NoteDocument } from '../types/storage';
 
@@ -15,9 +16,10 @@ describe('Sync Engine & Write-Ahead Offline Persistence', () => {
   let syncEngine: SyncEngine;
 
   beforeEach(async () => {
+    setActiveAccount('test_engine_account');
     await clearLocalDatabase();
     adapter = new MockDriveAdapter();
-    syncEngine = new SyncEngine(adapter);
+    syncEngine = new SyncEngine(adapter, 'test_engine_account');
   });
 
   const createNote = (id: string, text: string, baseDriveVersion = 1): NoteDocument => ({

@@ -1,28 +1,58 @@
-import { IStorageAdapter, DriveFolderInfo, ApplicationManifest, NoteDocument, DuplicateFileRecord } from '../../types/storage';
+import { IStorageAdapter, DriveFolderInfo, ApplicationManifest, NoteDocument, DuplicateFileRecord, GoogleUserProfile } from '../../types/storage';
 import { computeContentHash } from '../storage/hash';
 
 export class GoogleDriveStorageAdapter implements IStorageAdapter {
   private accessToken: string;
   private cachedFolderInfo: DriveFolderInfo | null = null;
+  public readonly accountId?: string;
 
-  constructor(accessToken: string) {
+  constructor(accessToken: string, accountId?: string) {
     this.accessToken = accessToken;
+    this.accountId = accountId;
   }
 
-  setAccessToken(token: string) {
+  setAccessToken(token: string, forAccountId?: string) {
+    if (forAccountId && this.accountId && forAccountId !== this.accountId) {
+      throw new Error(`Cannot assign token for account "${forAccountId}" to adapter bound to "${this.accountId}".`);
+    }
     if (this.accessToken !== token) {
       this.cachedFolderInfo = null;
     }
     this.accessToken = token;
   }
 
+  getAccessToken(): string {
+    return this.accessToken;
+  }
+
+  async getUserProfile(): Promise<GoogleUserProfile> {
+    const res = await this.fetchWithRetry(
+      'https://www.googleapis.com/drive/v3/about?fields=user(displayName,emailAddress,permissionId,photoLink)'
+    );
+    if (!res.ok) {
+      throw await this.parseErrorResponse(res, 'Failed to fetch Google user profile');
+    }
+    const data = await res.json();
+    const user = data.user;
+    if (!user || !user.permissionId || typeof user.permissionId !== 'string' || !user.permissionId.trim()) {
+      throw new Error('Google Drive API response did not contain a valid user permissionId.');
+    }
+    return {
+      displayName: user.displayName || 'Google Drive User',
+      emailAddress: user.emailAddress || 'Unknown Email',
+      permissionId: user.permissionId.trim(),
+      photoLink: user.photoLink,
+    };
+  }
+
   private async fetchWithRetry(url: string, options: RequestInit = {}, maxRetries = 4, baseDelay = 500): Promise<Response> {
+    const tokenForRequest = this.accessToken;
     let attempt = 0;
     while (attempt <= maxRetries) {
       try {
         const headers = new Headers(options.headers || {});
-        if (this.accessToken) {
-          headers.set('Authorization', `Bearer ${this.accessToken}`);
+        if (tokenForRequest) {
+          headers.set('Authorization', `Bearer ${tokenForRequest}`);
         }
 
         const response = await fetch(url, { ...options, headers });

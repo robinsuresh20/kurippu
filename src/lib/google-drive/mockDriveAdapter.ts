@@ -1,4 +1,4 @@
-import { IStorageAdapter, DriveFolderInfo, ApplicationManifest, NoteDocument, DuplicateFileRecord } from '../../types/storage';
+import { IStorageAdapter, DriveFolderInfo, ApplicationManifest, NoteDocument, DuplicateFileRecord, GoogleUserProfile } from '../../types/storage';
 import { computeContentHash } from '../storage/hash';
 
 export interface MockFile {
@@ -19,7 +19,35 @@ export class MockDriveAdapter implements IStorageAdapter {
   public failWithStatus = 500;
   public simulateRateLimitCount = 0;
   public networkConnected = true;
+  public readonly accountId?: string;
+  public token?: string;
   private idCounter = 1000;
+  private mockUser: GoogleUserProfile = {
+    displayName: 'Mock Test User',
+    emailAddress: 'tester@kurippu.local',
+    permissionId: 'mock_permission_default',
+  };
+
+  public onBeforeGetNote?: (noteId: string) => Promise<void> | void;
+  public onBeforeSaveNote?: (note: NoteDocument) => Promise<void> | void;
+  public onBeforeSaveManifest?: (manifest: ApplicationManifest) => Promise<void> | void;
+  public onBeforeGetManifest?: () => Promise<void> | void;
+  public onBeforeDeleteNoteFile?: (fileId: string) => Promise<void> | void;
+  public onAfterDeleteNoteFile?: (fileId: string) => Promise<void> | void;
+
+  constructor(accountId?: string, token?: string) {
+    this.accountId = accountId;
+    this.token = token;
+  }
+
+  setMockUser(user: GoogleUserProfile) {
+    this.mockUser = user;
+  }
+
+  async getUserProfile(): Promise<GoogleUserProfile> {
+    this.checkNetwork();
+    return { ...this.mockUser };
+  }
 
   private generateId(prefix = 'mock_file_') {
     return `${prefix}${++this.idCounter}`;
@@ -114,6 +142,7 @@ export class MockDriveAdapter implements IStorageAdapter {
 
   async getManifest(folderInfo: DriveFolderInfo): Promise<{ manifest: ApplicationManifest; version?: number } | null> {
     this.checkNetwork();
+    if (this.onBeforeGetManifest) await this.onBeforeGetManifest();
 
     if (!folderInfo.manifestFileId) {
       const manifest = Array.from(this.files.values()).find(
@@ -141,6 +170,7 @@ export class MockDriveAdapter implements IStorageAdapter {
 
   async saveManifest(folderInfo: DriveFolderInfo, manifest: ApplicationManifest): Promise<{ fileId: string; version: number }> {
     this.checkNetwork();
+    if (this.onBeforeSaveManifest) await this.onBeforeSaveManifest(manifest);
 
     if (folderInfo.duplicateManifestFileIds && (!manifest.duplicateManifestFileIds || manifest.duplicateManifestFileIds.length === 0)) {
       manifest.duplicateManifestFileIds = folderInfo.duplicateManifestFileIds;
@@ -188,6 +218,7 @@ export class MockDriveAdapter implements IStorageAdapter {
     driveFileId?: string
   ): Promise<{ note: NoteDocument; version?: number; duplicates?: DuplicateFileRecord[] } | null> {
     this.checkNetwork();
+    if (this.onBeforeGetNote) await this.onBeforeGetNote(noteId);
 
     let canonical: MockFile | undefined;
     let duplicates: DuplicateFileRecord[] = [];
@@ -229,6 +260,7 @@ export class MockDriveAdapter implements IStorageAdapter {
 
   async saveNote(note: NoteDocument, folderInfo: DriveFolderInfo): Promise<{ fileId: string; version: number; contentHash: string }> {
     this.checkNetwork();
+    if (this.onBeforeSaveNote) await this.onBeforeSaveNote(note);
 
     const hash = note.contentHash || (await computeContentHash(note.content));
     const payload = { ...note, contentHash: hash };
@@ -292,9 +324,11 @@ export class MockDriveAdapter implements IStorageAdapter {
 
   async deleteNoteFile(fileId: string): Promise<void> {
     this.checkNetwork();
+    if (this.onBeforeDeleteNoteFile) await this.onBeforeDeleteNoteFile(fileId);
     const file = this.files.get(fileId);
     if (file) {
       file.trashed = true;
     }
+    if (this.onAfterDeleteNoteFile) await this.onAfterDeleteNoteFile(fileId);
   }
 }
