@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useAuthStore } from './features/auth/authStore';
-import { NoteDocument, PersistenceState, SyncJob } from './types/storage';
+import { NoteDocument, PersistenceState, SyncJob, GoogleUserProfile } from './types/storage';
 import { GoogleDriveStorageAdapter } from './lib/google-drive/driveAdapter';
 import { MockDriveAdapter } from './lib/google-drive/mockDriveAdapter';
 import { SyncEngine } from './features/sync/syncEngine';
@@ -14,6 +14,15 @@ import {
   getAllQueueJobs,
   clearLocalDatabase,
   requestPersistentStorage,
+  setActiveAccount,
+  getActiveAccountId,
+  getActiveAccountSessionId,
+  StaleSessionError,
+  AccountMismatchError,
+  inspectLegacyCache,
+  importLegacyCacheToActiveAccount,
+  LegacyCacheSummary,
+  LegacyCacheImportResult,
 } from './lib/indexeddb/cache';
 import { reconstructManifestFromNotes } from './lib/storage/reconciliation';
 import { computeContentHash } from './lib/storage/hash';
@@ -41,6 +50,82 @@ declare global {
   }
 }
 
+export interface LegacyImportWorkflowParams {
+  targetAccountId: string;
+  migrationSessionId: number;
+  getActiveAccountId: () => string | null;
+  getActiveAccountSessionId: () => number;
+  importLegacyCache: (accountId: string) => Promise<LegacyCacheImportResult>;
+  refreshLocalData: () => Promise<void>;
+  processQueue: () => Promise<void>;
+  setLegacyCacheInfo: (info: LegacyCacheSummary | null) => void;
+  setIsMigratingLegacy: (loading: boolean) => void;
+  addLog?: (msg: string) => void;
+}
+
+/**
+ * Production helper that coordinates legacy cache import, session-currency validation,
+ * UI updates, and subsequent sync queue processing.
+ * Returns true if migration and subsequent steps completed for the active session, false if cancelled.
+ */
+export async function executeLegacyImportWorkflow(params: LegacyImportWorkflowParams): Promise<boolean> {
+  const {
+    targetAccountId,
+    migrationSessionId,
+    getActiveAccountId,
+    getActiveAccountSessionId,
+    importLegacyCache,
+    refreshLocalData,
+    processQueue,
+    setLegacyCacheInfo,
+    setIsMigratingLegacy,
+    addLog = () => {},
+  } = params;
+
+  if (getActiveAccountId() !== targetAccountId || getActiveAccountSessionId() !== migrationSessionId) {
+    return false;
+  }
+
+  setIsMigratingLegacy(true);
+  try {
+    addLog(`Importing unassigned legacy cache into ${targetAccountId}...`);
+    const res = await importLegacyCache(targetAccountId);
+
+    // Verify session currency before updating UI state or starting follow-up operations
+    if (getActiveAccountId() !== targetAccountId || getActiveAccountSessionId() !== migrationSessionId) {
+      return false;
+    }
+
+    addLog(`Legacy import complete: ${res.importedNotesCount} notes and ${res.importedJobsCount} jobs imported.`);
+    setLegacyCacheInfo(null);
+
+    await refreshLocalData();
+    if (getActiveAccountId() !== targetAccountId || getActiveAccountSessionId() !== migrationSessionId) {
+      return false;
+    }
+
+    await processQueue();
+    return true;
+  } catch (err: any) {
+    if (
+      err instanceof StaleSessionError ||
+      err?.name === 'StaleSessionError' ||
+      err instanceof AccountMismatchError ||
+      err?.name === 'AccountMismatchError'
+    ) {
+      // Expected cancellation caused by account switch or sign-out
+      return false;
+    }
+    addLog(`Legacy import failed: ${err.message}`);
+    throw err;
+  } finally {
+    // Only reset spinner if the session that started it is still current
+    if (getActiveAccountId() === targetAccountId && getActiveAccountSessionId() === migrationSessionId) {
+      setIsMigratingLegacy(false);
+    }
+  }
+}
+
 export const App: React.FC = () => {
   const {
     user,
@@ -65,10 +150,12 @@ export const App: React.FC = () => {
   const [queueJobs, setQueueJobs] = useState<SyncJob[]>([]);
   const [isOffline, setIsOffline] = useState(false);
   const [storageInfo, setStorageInfo] = useState<{ persisted: boolean; quota?: number; usage?: number }>({ persisted: false });
+  const [legacyCacheInfo, setLegacyCacheInfo] = useState<LegacyCacheSummary | null>(null);
+  const [isMigratingLegacy, setIsMigratingLegacy] = useState(false);
 
   const mockAdapterRef = useRef(new MockDriveAdapter());
   const driveAdapterRef = useRef<GoogleDriveStorageAdapter | null>(null);
-  const syncEngineRef = useRef<SyncEngine>(new SyncEngine(mockAdapterRef.current));
+  const syncEngineRef = useRef<SyncEngine>(new SyncEngine(mockAdapterRef.current, 'mock'));
   const debounceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const addLog = (msg: string) => {
@@ -99,7 +186,6 @@ export const App: React.FC = () => {
       },
     });
 
-    refreshLocalData();
     return () => {
       unsubscribe();
       if (debounceTimeoutRef.current) {
@@ -108,26 +194,37 @@ export const App: React.FC = () => {
     };
   }, []);
 
-  // Manage adapter routing based on user's selected storageMode
+  // Manage adapter routing and account partition activation
   useEffect(() => {
+    setIsMigratingLegacy(false);
     if (storageMode === 'mock') {
+      setActiveAccount('mock');
       syncEngineRef.current.setAuthRequired(false);
-      syncEngineRef.current.setAdapter(mockAdapterRef.current);
-      addLog('Storage Target: In-Memory Mock Drive');
+      syncEngineRef.current.setAdapter(mockAdapterRef.current, 'mock');
+      addLog('Storage Target: In-Memory Mock Drive (Partition: mock)');
+      refreshLocalData();
     } else {
-      if (!driveAdapterRef.current) {
-        driveAdapterRef.current = new GoogleDriveStorageAdapter(accessToken || '');
-      } else if (accessToken) {
-        driveAdapterRef.current.setAccessToken(accessToken);
-      }
-      syncEngineRef.current.setAdapter(driveAdapterRef.current);
-
-      if (!accessToken) {
-        syncEngineRef.current.setAuthRequired(true);
-        addLog('Storage Target: Live Google Drive (Authorization Required — Offline/Local buffer active)');
-      } else {
+      if (accessToken && user?.sub) {
+        setActiveAccount(user.sub);
+        if (!driveAdapterRef.current || driveAdapterRef.current.accountId !== user.sub) {
+          driveAdapterRef.current = new GoogleDriveStorageAdapter(accessToken, user.sub);
+        } else {
+          driveAdapterRef.current.setAccessToken(accessToken, user.sub);
+        }
+        syncEngineRef.current.setAdapter(driveAdapterRef.current, user.sub);
         syncEngineRef.current.setAuthRequired(false);
-        addLog('Storage Target: Live Google Drive (Authorized)');
+        addLog(`Storage Target: Live Google Drive (${user.email} - Partition: ${user.sub})`);
+        refreshLocalData();
+
+        inspectLegacyCache().then(summary => {
+          if (summary.exists) setLegacyCacheInfo(summary);
+        }).catch(() => {});
+      } else {
+        setActiveAccount(null);
+        syncEngineRef.current.setAdapter(mockAdapterRef.current, null);
+        syncEngineRef.current.setAuthRequired(true);
+        addLog('Storage Target: Live Google Drive (Authorization Required — Disconnected)');
+        refreshLocalData();
       }
     }
   }, [storageMode, accessToken]);
@@ -196,17 +293,54 @@ export const App: React.FC = () => {
   }, [storageMode, accessToken, isOffline]);
 
   const refreshLocalData = async () => {
-    const localNotes = await listNotesLocal();
-    setNotes(localNotes);
-    const jobs = await getAllQueueJobs();
-    setQueueJobs(jobs);
-    const currentActive = activeNoteRef.current;
-    if (currentActive) {
-      const updated = localNotes.find(n => n.id === currentActive.id);
-      if (updated) {
-        activeNoteRef.current = updated;
-        setActiveNote(updated);
+    const accountId = getActiveAccountId();
+    const sessionId = getActiveAccountSessionId();
+
+    if (!accountId) {
+      setNotes([]);
+      setQueueJobs([]);
+      setActiveNote(null);
+      activeNoteRef.current = null;
+      return;
+    }
+
+    try {
+      const localNotes = await listNotesLocal(accountId, false, sessionId);
+      if (getActiveAccountId() !== accountId || getActiveAccountSessionId() !== sessionId) {
+        return;
       }
+
+      const jobs = await getAllQueueJobs(accountId, sessionId);
+      if (getActiveAccountId() !== accountId || getActiveAccountSessionId() !== sessionId) {
+        return;
+      }
+
+      // Update state only if session is still current
+      setNotes(localNotes);
+      setQueueJobs(jobs);
+
+      const currentActive = activeNoteRef.current;
+      if (currentActive) {
+        if (getActiveAccountId() !== accountId || getActiveAccountSessionId() !== sessionId) {
+          return;
+        }
+        const updated = localNotes.find(n => n.id === currentActive.id);
+        if (updated) {
+          activeNoteRef.current = updated;
+          setActiveNote(updated);
+        }
+      }
+    } catch (err: any) {
+      if (
+        err instanceof StaleSessionError ||
+        err?.name === 'StaleSessionError' ||
+        err instanceof AccountMismatchError ||
+        err?.name === 'AccountMismatchError'
+      ) {
+        // Expected cancellation caused by account switching or sign-out
+        return;
+      }
+      console.warn('[App] Failed to refresh local data:', err.message);
     }
   };
 
@@ -231,25 +365,51 @@ export const App: React.FC = () => {
           addLog(`Auth Error: ${resp.error} - ${resp.error_description || ''}`);
           return;
         }
-        setAccessToken(resp.access_token, parseInt(resp.expires_in || '3600', 10));
-        setUser({
-          email: 'Authorized User',
-          name: 'Google Drive User',
-          sub: 'authorized_gdrive',
-        });
-        setStorageMode('drive');
-        addLog('Google Drive Authorization Successful (drive.file scope acquired)');
 
-        // Synchronously configure Drive adapter and attach to SyncEngine before triggering hydration
-        if (!driveAdapterRef.current) {
-          driveAdapterRef.current = new GoogleDriveStorageAdapter(resp.access_token);
-        } else {
-          driveAdapterRef.current.setAccessToken(resp.access_token);
+        // 1. Fetch real Google identity via about.get
+        const adapter = new GoogleDriveStorageAdapter(resp.access_token);
+        let profile: GoogleUserProfile;
+        try {
+          profile = await adapter.getUserProfile();
+        } catch (err: any) {
+          addLog(`Authentication failed: Could not verify Google user identity (${err.message})`);
+          alert(`Google Authentication failed: Could not establish verified identity.\n${err.message}`);
+          return;
         }
-        syncEngineRef.current.setAdapter(driveAdapterRef.current);
+
+        // 2. Select account partition in IndexedDB BEFORE loading notes or syncing
+        setActiveAccount(profile.permissionId);
+
+        // 3. Update auth store with verified Google profile
+        setUser({
+          email: profile.emailAddress,
+          name: profile.displayName,
+          sub: profile.permissionId,
+          picture: profile.photoLink,
+        });
+        setAccessToken(resp.access_token, parseInt(resp.expires_in || '3600', 10));
+        setStorageMode('drive');
+        addLog(`Google Drive Authorization Successful for ${profile.emailAddress} (Account: ${profile.permissionId})`);
+
+        const boundAdapter = new GoogleDriveStorageAdapter(resp.access_token, profile.permissionId);
+        driveAdapterRef.current = boundAdapter;
+        syncEngineRef.current.setAdapter(boundAdapter, profile.permissionId);
         syncEngineRef.current.setAuthRequired(false);
 
-        // Automatically hydrate and reconcile notes from Google Drive
+        // 4. Load notes from this account's partition into UI
+        await refreshLocalData();
+
+        // 5. Inspect if unassigned legacy data exists in kurippu_local_cache
+        try {
+          const legacySummary = await inspectLegacyCache();
+          if (legacySummary.exists) {
+            setLegacyCacheInfo(legacySummary);
+          }
+        } catch (e) {
+          console.warn('[App] Error inspecting legacy cache:', e);
+        }
+
+        // 6. Automatically hydrate and reconcile notes from Google Drive
         try {
           addLog('Hydrating and reconciling notes from Google Drive...');
           await syncEngineRef.current.hydrateAndReconcileFromDrive();
@@ -264,15 +424,64 @@ export const App: React.FC = () => {
     tokenClient.requestAccessToken({ prompt: 'consent' });
   };
 
-  const handleSimulateToken = () => {
+  const handleSimulateToken = async () => {
+    const simSub = 'local_test_sub';
+    setActiveAccount(simSub);
     setAccessToken('mock_token_' + nanoid(10), 3600);
     setUser({
       email: 'tester@kurippu.local',
       name: 'Local Test Account',
-      sub: 'local_test_sub',
+      sub: simSub,
     });
     setStorageMode('drive');
     addLog('Simulated test token initialized for Drive mode (1 hour validity)');
+    await refreshLocalData();
+  };
+
+  const handleSignOut = () => {
+    // 1. Stop background sync and active polling
+    syncEngineRef.current.stopAutoPoll();
+
+    // 2. Clear drive adapter reference so old instance is never reused
+    driveAdapterRef.current = null;
+
+    // 3. Switch sync engine to mock adapter and reset
+    syncEngineRef.current.setAdapter(mockAdapterRef.current, null);
+    syncEngineRef.current.setAuthRequired(true);
+
+    // 4. Close active account partition in IndexedDB
+    setActiveAccount(null);
+
+    // 5. Clear all account-specific in-memory React state
+    setNotes([]);
+    setActiveNote(null);
+    activeNoteRef.current = null;
+    setQueueJobs([]);
+    setLegacyCacheInfo(null);
+    setIsMigratingLegacy(false);
+
+    // 6. Update auth store
+    signOut();
+    addLog('Disconnected from Google Drive. Active account partition closed.');
+  };
+
+  const handleImportLegacyCache = async () => {
+    if (!user?.sub) return;
+    const targetAccountId = user.sub;
+    const migrationSessionId = getActiveAccountSessionId();
+
+    await executeLegacyImportWorkflow({
+      targetAccountId,
+      migrationSessionId,
+      getActiveAccountId,
+      getActiveAccountSessionId,
+      importLegacyCache: importLegacyCacheToActiveAccount,
+      refreshLocalData,
+      processQueue: () => syncEngineRef.current.processQueue(),
+      setLegacyCacheInfo,
+      setIsMigratingLegacy,
+      addLog,
+    });
   };
 
   const handleManualHydrate = async () => {
@@ -539,6 +748,37 @@ export const App: React.FC = () => {
         </div>
       </header>
 
+      {/* Legacy Data Isolation & Recovery Banner */}
+      {legacyCacheInfo && legacyCacheInfo.exists && (
+        <div className="bg-amber-950/40 border-b border-amber-800/60 px-6 py-3 flex items-center justify-between text-xs text-amber-200">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+            <div>
+              <span className="font-semibold">Unassigned Legacy Cache Detected:</span>{' '}
+              {legacyCacheInfo.notesCount} note(s), {legacyCacheInfo.pendingJobsCount} pending job(s) found in <code>kurippu_local_cache</code> from before account isolation.
+              Preserved safely and unassigned.
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {user?.sub && (
+              <button
+                onClick={handleImportLegacyCache}
+                disabled={isMigratingLegacy}
+                className="px-2.5 py-1 bg-amber-600 hover:bg-amber-500 text-white rounded font-medium disabled:opacity-50"
+              >
+                {isMigratingLegacy ? 'Importing...' : `Import into ${user.email}`}
+              </button>
+            )}
+            <button
+              onClick={() => setLegacyCacheInfo(null)}
+              className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded font-medium"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Main Grid Content */}
       <main className="flex-1 p-6 grid grid-cols-1 lg:grid-cols-12 gap-6 max-w-7xl mx-auto w-full">
         {/* Left Column: Auth, Mode & Storage Info (4 cols) */}
@@ -624,7 +864,7 @@ export const App: React.FC = () => {
                     <DownloadCloud className="w-3.5 h-3.5" /> Hydrate from Drive
                   </button>
                   <button
-                    onClick={signOut}
+                    onClick={handleSignOut}
                     className="py-1.5 px-3 bg-red-950/60 hover:bg-red-900/60 border border-red-800 text-red-300 rounded text-xs font-medium"
                   >
                     Disconnect

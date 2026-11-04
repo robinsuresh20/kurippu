@@ -1,5 +1,9 @@
 import '@testing-library/jest-dom';
 import 'fake-indexeddb/auto';
+import { setActiveAccount } from '../lib/indexeddb/cache';
+
+// Set default test account partition
+setActiveAccount('test_default');
 
 // Global mocks for testing environment
 if (typeof window !== 'undefined') {

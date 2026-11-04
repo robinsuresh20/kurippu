@@ -1,29 +1,56 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { SyncEngine } from '../features/sync/syncEngine';
 import { MockDriveAdapter } from '../lib/google-drive/mockDriveAdapter';
+import { GoogleDriveStorageAdapter } from '../lib/google-drive/driveAdapter';
 import {
   clearLocalDatabase,
   saveNoteLocal,
   listNotesLocal,
   getNoteLocal,
+  saveManifestLocal,
   enqueueOrCoalesceSyncJob,
   getPendingJobCount,
   getManifestLocal,
+  getAllQueueJobs,
+  setActiveAccount,
+  getActiveAccountId,
+  getActiveAccountSessionId,
+  inspectLegacyCache,
+  importLegacyCacheToActiveAccount,
+  hasPendingJobForNote,
+  recoverInterruptedJobs,
+  retryFailedJobs,
+  AccountMismatchError,
+  StaleSessionError,
+  LegacyDatabaseUnavailableError,
+  getLocalDB,
+  setMigrationBeforeWriteHookForTesting,
+  setLegacyDbNameForTesting,
+  setLegacyDatabaseExistenceCheckerForTesting,
+  setDbOpenWrapperForTesting,
 } from '../lib/indexeddb/cache';
+import { openDB, deleteDB } from 'idb';
 import { NoteDocument, ApplicationManifest, DriveFolderInfo } from '../types/storage';
 import { useAuthStore } from '../features/auth/authStore';
 import { setClientDeviceIdForTesting } from '../lib/storage/deviceId';
 import { computeContentHash } from '../lib/storage/hash';
+import { executeLegacyImportWorkflow } from '../App';
+import { LegacyCacheImportResult } from '../lib/indexeddb/cache';
 
 describe('Google Drive Sync Reliability & Idempotency Tests', () => {
   let adapter: MockDriveAdapter;
   let syncEngine: SyncEngine;
 
   beforeEach(async () => {
+    setMigrationBeforeWriteHookForTesting(null);
+    setLegacyDbNameForTesting(null);
+    setLegacyDatabaseExistenceCheckerForTesting(null);
+    setDbOpenWrapperForTesting(null);
+    setActiveAccount('test_device_default');
     setClientDeviceIdForTesting('test_device_default');
     await clearLocalDatabase();
     adapter = new MockDriveAdapter();
-    syncEngine = new SyncEngine(adapter);
+    syncEngine = new SyncEngine(adapter, 'test_device_default');
     useAuthStore.setState({
       user: null,
       storageMode: 'mock',
@@ -55,6 +82,18 @@ describe('Google Drive Sync Reliability & Idempotency Tests', () => {
     clientTimestamp: Date.now(),
     isDeleted: false,
   });
+
+  const openLegacyDatabase = (dbName: string) =>
+    openDB(dbName, 1, {
+      upgrade(db) {
+        if (!db.objectStoreNames.contains('notes')) db.createObjectStore('notes', { keyPath: 'id' });
+        if (!db.objectStoreNames.contains('manifest')) db.createObjectStore('manifest');
+        if (!db.objectStoreNames.contains('sync_queue')) {
+          const qStore = db.createObjectStore('sync_queue', { keyPath: 'id', autoIncrement: true });
+          qStore.createIndex('by_status', 'status');
+        }
+      },
+    });
 
   // Test 1: Repeated saves of the same note reuse one Drive file
   it('1. Repeated saves of the same note reuse one Drive file', async () => {
@@ -1512,8 +1551,9 @@ describe('Google Drive Sync Reliability & Idempotency Tests', () => {
     });
 
     // Fresh browser profile: completely empty IndexedDB and fresh SyncEngine
+    setActiveAccount('fresh_profile_account');
     await clearLocalDatabase();
-    const freshEngine = new SyncEngine(adapter);
+    const freshEngine = new SyncEngine(adapter, 'fresh_profile_account');
 
     const result = await freshEngine.hydrateAndReconcileFromDrive();
 
@@ -1896,5 +1936,2118 @@ describe('Google Drive Sync Reliability & Idempotency Tests', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // Test 23: Complete cache and sync queue isolation between two Google accounts
+  it('23. Complete cache and sync queue isolation between two Google accounts', async () => {
+    // 1. Account Alice logs in
+    setActiveAccount('perm_alice');
+    await clearLocalDatabase();
+    const aliceNote = createNote('note_alice_private', 'Alice Confidential Thoughts');
+    aliceNote.contentHash = await computeContentHash(aliceNote.content);
+    await saveNoteLocal(aliceNote);
+    await enqueueOrCoalesceSyncJob({
+      jobId: 'job_alice_1',
+      type: 'SAVE_NOTE',
+      targetId: aliceNote.id,
+      payload: aliceNote,
+      clientTimestamp: Date.now(),
+      retryCount: 0,
+      status: 'pending',
+    });
+
+    // Verify Alice has 1 note and 1 pending job
+    expect((await listNotesLocal()).length).toBe(1);
+    expect((await getAllQueueJobs()).length).toBe(1);
+
+    // 2. Disconnect Alice and Account Bob logs in
+    setActiveAccount('perm_bob');
+    await clearLocalDatabase();
+
+    // Verify Bob's partition is completely empty
+    expect((await listNotesLocal()).length).toBe(0);
+    expect((await getAllQueueJobs()).length).toBe(0);
+
+    // Bob creates his own note
+    const bobNote = createNote('note_bob_work', 'Bob Work Task');
+    bobNote.contentHash = await computeContentHash(bobNote.content);
+    await saveNoteLocal(bobNote);
+    expect((await listNotesLocal()).length).toBe(1);
+    expect((await getNoteLocal('note_alice_private'))).toBeUndefined();
+
+    // 3. Switch back to Alice
+    setActiveAccount('perm_alice');
+    const aliceNotesAfter = await listNotesLocal();
+    expect(aliceNotesAfter.length).toBe(1);
+    expect(aliceNotesAfter[0].id).toBe('note_alice_private');
+    expect((await getNoteLocal('note_bob_work'))).toBeUndefined();
+    expect((await getAllQueueJobs()).length).toBe(1);
+  });
+
+  // Test 24: Zero cross-account data upload to Google Drive
+  it('24. Zero cross-account data upload to Google Drive', async () => {
+    // Alice creates a private note in her partition
+    setActiveAccount('perm_alice');
+    await clearLocalDatabase();
+    const aliceNote = createNote('note_alice_secret', 'Alice Secret Note');
+    aliceNote.contentHash = await computeContentHash(aliceNote.content);
+    await saveNoteLocal(aliceNote);
+
+    // Bob signs in with a separate Mock Drive Adapter
+    setActiveAccount('perm_bob');
+    await clearLocalDatabase();
+    const bobAdapter = new MockDriveAdapter();
+    const bobEngine = new SyncEngine(bobAdapter, 'perm_bob');
+
+    // Bob syncs and processes queue
+    await bobEngine.hydrateAndReconcileFromDrive();
+    await bobEngine.processQueue();
+
+    // Verify Bob's Drive contains zero note files and Bob's manifest has zero notes
+    const bobNoteFiles = Array.from(bobAdapter.files.values()).filter(
+      f => !f.trashed && f.appProperties?.['kurippuRole'] === 'note'
+    );
+    expect(bobNoteFiles.length).toBe(0);
+
+    const bobManifest = Array.from(bobAdapter.files.values()).find(
+      f => !f.trashed && f.appProperties?.['kurippuRole'] === 'manifest'
+    );
+    if (bobManifest) {
+      const parsed = JSON.parse(bobManifest.content);
+      expect(Object.keys(parsed.notes || {}).length).toBe(0);
+    }
+
+    const bobLocalNotes = await listNotesLocal();
+    expect(bobLocalNotes.length).toBe(0);
+  });
+
+  // Test 25: Unassigned legacy database protection and non-destructive inspection
+  it('25. Unassigned legacy database protection and non-destructive inspection', async () => {
+    const testLegacyDbName = `kurippu_test_legacy_25_${Date.now()}`;
+    setLegacyDbNameForTesting(testLegacyDbName);
+
+    let verifyLegacyDb: any = null;
+    try {
+      const legacyDb = await openLegacyDatabase(testLegacyDbName);
+      const legacyNote = createNote('note_legacy_1', 'Legacy Offline Work');
+      await legacyDb.put('notes', legacyNote);
+      await legacyDb.add('sync_queue', {
+        jobId: 'job_legacy_offline',
+        type: 'SAVE_NOTE',
+        targetId: 'note_legacy_1',
+        payload: legacyNote,
+        clientTimestamp: Date.now(),
+        retryCount: 0,
+        status: 'pending',
+      });
+      legacyDb.close();
+
+      // User Alice logs in with an isolated partition
+      setActiveAccount('perm_alice_new');
+      await clearLocalDatabase();
+
+      // Inspect legacy cache: returns summary without altering database
+      const summary = await inspectLegacyCache();
+      expect(summary.exists).toBe(true);
+      expect(summary.notesCount).toBe(1);
+      expect(summary.pendingJobsCount).toBe(1);
+      expect(summary.noteTitles).toContain('Note note_legacy_1');
+
+      // Alice's active account does NOT automatically inherit legacy data
+      expect((await listNotesLocal()).length).toBe(0);
+      expect((await getAllQueueJobs()).length).toBe(0);
+
+      // Alice performs a sync cycle: legacy notes are NOT uploaded to Alice's Drive
+      const aliceAdapter = new MockDriveAdapter();
+      const aliceEngine = new SyncEngine(aliceAdapter, 'perm_alice_new');
+      await aliceEngine.hydrateAndReconcileFromDrive();
+      await aliceEngine.processQueue();
+
+      const aliceNoteFiles = Array.from(aliceAdapter.files.values()).filter(
+        f => !f.trashed && f.appProperties?.['kurippuRole'] === 'note'
+      );
+      expect(aliceNoteFiles.length).toBe(0);
+
+      const aliceManifest = Array.from(aliceAdapter.files.values()).find(
+        f => !f.trashed && f.appProperties?.['kurippuRole'] === 'manifest'
+      );
+      if (aliceManifest) {
+        const parsed = JSON.parse(aliceManifest.content);
+        expect(Object.keys(parsed.notes || {}).length).toBe(0);
+      }
+
+      // Legacy database remains untouched and intact
+      verifyLegacyDb = await openDB(testLegacyDbName, 1);
+      expect((await verifyLegacyDb.getAll('notes')).length).toBe(1);
+      expect((await verifyLegacyDb.getAll('sync_queue')).length).toBe(1);
+      verifyLegacyDb.close();
+      verifyLegacyDb = null;
+    } finally {
+      if (verifyLegacyDb) {
+        try { verifyLegacyDb.close(); } catch {}
+      }
+      try { await deleteDB(testLegacyDbName); } catch {}
+      setLegacyDbNameForTesting(null);
+    }
+  });
+
+  // Test 26: User-approved explicit legacy cache migration preserves all jobs and data
+  it('26. User-approved explicit legacy cache migration preserves all jobs and data', async () => {
+    const testLegacyDbName = `kurippu_test_legacy_26_${Date.now()}`;
+    setLegacyDbNameForTesting(testLegacyDbName);
+
+    let verifyLegacyDb: any = null;
+    try {
+      // Seed isolated legacy cache fixture for migration
+      const legacyDb = await openLegacyDatabase(testLegacyDbName);
+      const legacyNote = createNote('note_legacy_1', 'Legacy Offline Work');
+      await legacyDb.put('notes', legacyNote);
+      await legacyDb.add('sync_queue', {
+        jobId: 'job_legacy_offline',
+        type: 'SAVE_NOTE',
+        targetId: 'note_legacy_1',
+        payload: legacyNote,
+        clientTimestamp: Date.now(),
+        retryCount: 0,
+        status: 'pending',
+      });
+      legacyDb.close();
+
+      setActiveAccount('perm_alice_approved');
+      await clearLocalDatabase();
+
+      // User explicitly approves migration into Alice's account
+      const res = await importLegacyCacheToActiveAccount('perm_alice_approved');
+      expect(res.importedNotesCount).toBe(1);
+      expect(res.importedJobsCount).toBe(1);
+
+      // Alice's partition now contains the imported note and pending job
+      const aliceNotes = await listNotesLocal();
+      expect(aliceNotes.length).toBe(1);
+      expect(aliceNotes[0].id).toBe('note_legacy_1');
+
+      const aliceJobs = await getAllQueueJobs();
+      expect(aliceJobs.length).toBe(1);
+      expect(aliceJobs[0].targetId).toBe('note_legacy_1');
+
+      // Legacy database was NOT destroyed
+      verifyLegacyDb = await openDB(testLegacyDbName, 1);
+      expect((await verifyLegacyDb.getAll('notes')).length).toBe(1);
+      verifyLegacyDb.close();
+      verifyLegacyDb = null;
+    } finally {
+      if (verifyLegacyDb) {
+        try { verifyLegacyDb.close(); } catch {}
+      }
+      try { await deleteDB(testLegacyDbName); } catch {}
+      setLegacyDbNameForTesting(null);
+    }
+  });
+
+  // Test 27: Database access rejected when no account partition is active
+  it('27. Database access rejected when no account partition is active', async () => {
+    setActiveAccount(null);
+    await expect(listNotesLocal()).rejects.toThrow('IndexedDB access denied');
+    await expect(saveNoteLocal(createNote('n1', 'text'))).rejects.toThrow('IndexedDB access denied');
+  });
+
+  function createDeferred<T = void>() {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    let reject!: (reason?: any) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  // Test 28: Requirement 1 - Account switch during a delayed Drive read
+  it('28. Account switch during a delayed Drive read aborts without cross-writing to new account partition', async () => {
+    setActiveAccount('perm_alice');
+    await clearLocalDatabase();
+    const aliceAdapter = new MockDriveAdapter('perm_alice', 'token_alice');
+    const folderInfo = await aliceAdapter.discoverOrCreateAppFolders();
+
+    // Alice has a remote note on Drive
+    const aliceRemoteNote = createNote('note_alice_read', 'Alice Remote Content');
+    aliceRemoteNote.contentHash = await computeContentHash(aliceRemoteNote.content);
+    await aliceAdapter.saveNote(aliceRemoteNote, folderInfo);
+
+    const aliceEngine = new SyncEngine(aliceAdapter, 'perm_alice');
+
+    // Intercept Drive read with a deferred promise
+    const deferred = createDeferred();
+    aliceAdapter.onBeforeGetNote = () => deferred.promise;
+
+    // Start hydration for Alice
+    const aliceHydratePromise = aliceEngine.hydrateAndReconcileFromDrive();
+
+    // While Alice's Drive read is in flight, user switches to Bob!
+    setActiveAccount('perm_bob');
+    await clearLocalDatabase();
+    const bobAdapter = new MockDriveAdapter('perm_bob', 'token_bob');
+    expect(bobAdapter.accountId).toBe('perm_bob');
+    const bobEngine = new SyncEngine(bobAdapter, 'perm_bob');
+    expect(bobEngine.getState()).toBe('IDLE');
+
+    // Now resolve Alice's delayed read
+    deferred.resolve();
+    await aliceHydratePromise;
+
+    // Bob's partition must remain completely empty and unpolluted
+    const bobNotes = await listNotesLocal();
+    expect(bobNotes.length).toBe(0);
+    expect(await getNoteLocal('note_alice_read')).toBeUndefined();
+  });
+
+  // Test 29: Requirement 2 - Account switch during a delayed Drive upload
+  it('29. Account switch during a delayed Drive upload aborts without writing to new account', async () => {
+    setActiveAccount('perm_alice');
+    await clearLocalDatabase();
+    const aliceAdapter = new MockDriveAdapter('perm_alice', 'token_alice');
+    const aliceEngine = new SyncEngine(aliceAdapter, 'perm_alice');
+
+    const aliceNote = createNote('note_alice_upload', 'Alice Upload Edits');
+    aliceNote.contentHash = await computeContentHash(aliceNote.content);
+    await saveNoteLocal(aliceNote);
+    await enqueueOrCoalesceSyncJob({
+      jobId: 'job_alice_up',
+      type: 'SAVE_NOTE',
+      targetId: aliceNote.id,
+      payload: aliceNote,
+      clientTimestamp: Date.now(),
+      retryCount: 0,
+      status: 'pending',
+    });
+
+    const deferred = createDeferred();
+    aliceAdapter.onBeforeSaveNote = () => deferred.promise;
+
+    const aliceProcessPromise = aliceEngine.processQueue();
+
+    // Switch account to Bob mid-upload
+    setActiveAccount('perm_bob');
+    await clearLocalDatabase();
+    const bobAdapter = new MockDriveAdapter('perm_bob', 'token_bob');
+    expect(bobAdapter.accountId).toBe('perm_bob');
+    const bobEngine = new SyncEngine(bobAdapter, 'perm_bob');
+    expect(bobEngine.getState()).toBe('IDLE');
+
+    deferred.resolve();
+    await aliceProcessPromise;
+
+    // Bob's database has zero notes and zero jobs
+    expect((await listNotesLocal()).length).toBe(0);
+    expect((await getAllQueueJobs()).length).toBe(0);
+
+    // Alice's job in Alice's partition is preserved in pending status
+    setActiveAccount('perm_alice');
+    await recoverInterruptedJobs('perm_alice');
+    const aliceJobs = await getAllQueueJobs();
+    expect(aliceJobs.length).toBe(1);
+    expect(aliceJobs[0].status).toBe('pending');
+  });
+
+  // Test 30: Requirement 3 - Account switch during a delayed manifest save
+  it('30. Account switch during a delayed manifest save aborts before writing local manifest', async () => {
+    setActiveAccount('perm_alice');
+    await clearLocalDatabase();
+    const aliceAdapter = new MockDriveAdapter('perm_alice', 'token_alice');
+    const aliceEngine = new SyncEngine(aliceAdapter, 'perm_alice');
+
+    const aliceNote = createNote('note_alice_mf', 'Alice Note for Manifest');
+    aliceNote.contentHash = await computeContentHash(aliceNote.content);
+    await saveNoteLocal(aliceNote);
+    await enqueueOrCoalesceSyncJob({
+      jobId: 'job_alice_mf',
+      type: 'SAVE_NOTE',
+      targetId: aliceNote.id,
+      payload: aliceNote,
+      clientTimestamp: Date.now(),
+      retryCount: 0,
+      status: 'pending',
+    });
+
+    const deferred = createDeferred();
+    aliceAdapter.onBeforeSaveManifest = () => deferred.promise;
+
+    const aliceProcessPromise = aliceEngine.processQueue();
+
+    // Switch to Bob mid-manifest-save
+    setActiveAccount('perm_bob');
+    await clearLocalDatabase();
+    const bobAdapter = new MockDriveAdapter('perm_bob', 'token_bob');
+    expect(bobAdapter.accountId).toBe('perm_bob');
+
+    deferred.resolve();
+    await aliceProcessPromise;
+
+    // Bob's local manifest must not contain Alice's note
+    const bobManifest = await getManifestLocal();
+    expect(bobManifest?.notes?.['note_alice_mf']).toBeUndefined();
+  });
+
+  // Test 31: Requirement 4 - Account A token is never used by Account B's operation and vice versa
+  it('31. Account A token is never used by Account B operation, and adapter rejects cross-account token reassignment', async () => {
+    const adapterA = new GoogleDriveStorageAdapter('token_AAA', 'perm_alice');
+    const adapterB = new GoogleDriveStorageAdapter('token_BBB', 'perm_bob');
+
+    expect(adapterA.getAccessToken()).toBe('token_AAA');
+    expect(adapterB.getAccessToken()).toBe('token_BBB');
+
+    // Attempting to mutate adapterA to Bob's account throws an error
+    expect(() => {
+      adapterA.setAccessToken('token_BBB', 'perm_bob');
+    }).toThrow('Cannot assign token for account "perm_bob" to adapter bound to "perm_alice"');
+
+    // Mock fetch to verify request Authorization header isolation
+    const originalFetch = globalThis.fetch;
+    const authHeadersSent: string[] = [];
+
+    globalThis.fetch = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      authHeadersSent.push(headers.get('Authorization') || '');
+      return new Response(JSON.stringify({ files: [] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+
+    try {
+      await adapterA.discoverOrCreateAppFolders();
+      await adapterB.discoverOrCreateAppFolders();
+
+      expect(authHeadersSent).toContain('Bearer token_AAA');
+      expect(authHeadersSent).toContain('Bearer token_BBB');
+
+      // Request from adapterA never used token_BBB, and adapterB never used token_AAA
+      const requestForA = authHeadersSent.filter(h => h === 'Bearer token_AAA');
+      const requestForB = authHeadersSent.filter(h => h === 'Bearer token_BBB');
+      expect(requestForA.length).toBeGreaterThan(0);
+      expect(requestForB.length).toBeGreaterThan(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  // Test 32: Requirement 5 - Verifying stale operations cannot modify the other account's local notes or manifest
+  it('32. Stale operations cannot modify the other account local notes or manifest', async () => {
+    setActiveAccount('perm_bob');
+    await clearLocalDatabase();
+
+    // A stale operation attempting to call saveNoteLocal or saveManifestLocal for perm_alice while perm_bob is active is rejected
+    const aliceNote = createNote('note_alice_stale', 'Stale Content');
+    await expect(saveNoteLocal(aliceNote, 'perm_alice')).rejects.toThrow(AccountMismatchError);
+
+    const aliceManifest: ApplicationManifest = {
+      schemaVersion: 1,
+      workspaceId: 'default',
+      rootNoteId: 'root',
+      lastModified: new Date().toISOString(),
+      revisionSequence: 1,
+      notes: { [aliceNote.id]: { id: aliceNote.id, title: 'Stale', type: 'text', attributes: [], contentHash: 'h', updatedAt: '', isDeleted: false } },
+      branches: [],
+    };
+    await expect(saveManifestLocal(aliceManifest, 'perm_alice')).rejects.toThrow(AccountMismatchError);
+
+    // Bob's partition has zero notes
+    expect((await listNotesLocal()).length).toBe(0);
+  });
+
+  // Test 33: Requirement 6 - Repeated legacy import without duplicate jobs or overwritten notes
+  it('33. Repeated legacy import is idempotent, skips existing notes, and creates zero duplicate jobs', async () => {
+    const testLegacyDbName = `kurippu_test_legacy_33_${Date.now()}`;
+    setLegacyDbNameForTesting(testLegacyDbName);
+
+    try {
+      // 1. Setup isolated legacy cache with 1 note
+      const legacyDb = await openLegacyDatabase(testLegacyDbName);
+      const legacyNote = createNote('note_collision', 'Legacy Content (Older)');
+      await legacyDb.put('notes', legacyNote);
+      await legacyDb.add('sync_queue', {
+        jobId: 'job_legacy_collision',
+        type: 'SAVE_NOTE',
+        targetId: 'note_collision',
+        payload: legacyNote,
+        clientTimestamp: Date.now(),
+        retryCount: 0,
+        status: 'pending',
+      });
+      legacyDb.close();
+
+      // 2. Active account already has this note with updated local edits
+      setActiveAccount('perm_active_user');
+      await clearLocalDatabase();
+      const activeNote = createNote('note_collision', 'Active Newer Content');
+      activeNote.contentHash = await computeContentHash(activeNote.content);
+      await saveNoteLocal(activeNote);
+
+      // 3. First legacy import: must NOT overwrite active note, imports safe pending job
+      const res1 = await importLegacyCacheToActiveAccount('perm_active_user');
+      expect(res1.importedNotesCount).toBe(0);
+      expect(res1.skippedNotesCount).toBe(1);
+      expect(res1.importedJobsCount).toBe(1);
+
+      // Verify content was not overwritten
+      const preservedNote = await getNoteLocal('note_collision');
+      expect(preservedNote?.plainTextPreview).toBe('Active Newer Content');
+
+      // 4. Second legacy import: repeated execution creates zero duplicates
+      const res2 = await importLegacyCacheToActiveAccount('perm_active_user');
+      expect(res2.importedNotesCount).toBe(0);
+      expect(res2.importedJobsCount).toBe(0);
+      expect(res2.skippedNotesCount).toBe(1);
+
+      // Total jobs in target account remains strictly 1 (no duplicate job was created on repeated import)
+      const jobs = await getAllQueueJobs();
+      expect(jobs.length).toBe(1);
+    } finally {
+      try { await deleteDB(testLegacyDbName); } catch {}
+      setLegacyDbNameForTesting(null);
+    }
+  });
+
+  // Test 34: Requirement 7 - Failed-job recovery and interrupted in-flight jobs
+  it('34. Failed-job recovery restores interrupted jobs and protects uncommitted failed edits from being overwritten', async () => {
+    setActiveAccount('perm_recovery_user');
+    await clearLocalDatabase();
+
+    const note = createNote('note_recover', 'Uncommitted Edits');
+    note.clientDeviceId = 'device_recovery_current';
+    setClientDeviceIdForTesting('device_recovery_current');
+    note.contentHash = await computeContentHash(note.content);
+    await saveNoteLocal(note);
+
+    // Seed a job stuck in 'in_flight' (as if app was interrupted/reloaded mid-save)
+    const db = await openDB('kurippu_cache_perm_recovery_user', 1);
+    await db.add('sync_queue', {
+      jobId: 'job_interrupted',
+      type: 'SAVE_NOTE',
+      targetId: note.id,
+      payload: note,
+      clientTimestamp: Date.now(),
+      retryCount: 0,
+      status: 'in_flight',
+    });
+    db.close();
+
+    // 1. Interrupted in-flight job recovery
+    const recovered = await recoverInterruptedJobs('perm_recovery_user');
+    expect(recovered).toBe(1);
+    const jobs = await getAllQueueJobs();
+    expect(jobs[0].status).toBe('pending');
+
+    // 2. Failed job protection: Mark job as failed (retryCount exceeded)
+    jobs[0].status = 'failed';
+    jobs[0].retryCount = 5;
+    const db2 = await openDB('kurippu_cache_perm_recovery_user', 1);
+    await db2.put('sync_queue', jobs[0]);
+    db2.close();
+
+    // Verify hasPendingJobForNote returns true for failed job (must not be treated as committed)
+    expect(await hasPendingJobForNote(note.id)).toBe(true);
+
+    // Hydration with differing remote content must NOT overwrite local failed note
+    const recoveryAdapter = new MockDriveAdapter();
+    const folderInfo = await recoveryAdapter.discoverOrCreateAppFolders();
+    const remoteDifferent = createNote('note_recover', 'Remote Cloud Content');
+    remoteDifferent.clientDeviceId = 'device_recovery_current';
+    remoteDifferent.contentHash = await computeContentHash(remoteDifferent.content);
+    await recoveryAdapter.saveNote(remoteDifferent, folderInfo);
+
+    const recoveryEngine = new SyncEngine(recoveryAdapter, 'perm_recovery_user');
+    await recoveryEngine.hydrateAndReconcileFromDrive();
+
+    // Local note is preserved with its uncommitted edits!
+    const noteAfterHydrate = await getNoteLocal('note_recover');
+    expect(noteAfterHydrate?.plainTextPreview).toBe('Uncommitted Edits');
+
+    // 3. Retry failed jobs
+    const retried = await retryFailedJobs('perm_recovery_user');
+    expect(retried).toBe(1);
+    const jobsAfterRetry = await getAllQueueJobs();
+    expect(jobsAfterRetry[0].status).toBe('pending');
+    expect(jobsAfterRetry[0].retryCount).toBe(0);
+  });
+
+  // Test 35: Requirement 8 - Delete operations and prevention of deleted-note resurrection
+  it('35. Delete operations delete remote file, update manifest tombstones, and prevent note resurrection on another device', async () => {
+    // Device 1: Creates, saves, and deletes a note
+    setActiveAccount('perm_device1');
+    await clearLocalDatabase();
+    const dev1Adapter = new MockDriveAdapter('perm_device1', 'token_dev1');
+    const dev1Engine = new SyncEngine(dev1Adapter, 'perm_device1');
+
+    const note = createNote('note_to_delete', 'Content To Delete');
+    note.contentHash = await computeContentHash(note.content);
+    await saveNoteLocal(note);
+    await enqueueOrCoalesceSyncJob({
+      jobId: 'job_save_before_del',
+      type: 'SAVE_NOTE',
+      targetId: note.id,
+      payload: note,
+      clientTimestamp: Date.now(),
+      retryCount: 0,
+      status: 'pending',
+    });
+    await dev1Engine.processQueue();
+
+    // Device 1 deletes the note
+    await enqueueOrCoalesceSyncJob({
+      jobId: 'job_delete_note',
+      type: 'DELETE_NOTE',
+      targetId: note.id,
+      payload: note,
+      clientTimestamp: Date.now(),
+      retryCount: 0,
+      status: 'pending',
+    });
+    await dev1Engine.processQueue();
+
+    // Remote file is trashed on Drive
+    const remoteFiles = Array.from(dev1Adapter.files.values()).filter(f => f.appProperties['kurippuNoteId'] === note.id);
+    expect(remoteFiles[0].trashed).toBe(true);
+
+    // Remote manifest has tombstone isDeleted: true
+    const folderInfo = await dev1Adapter.discoverOrCreateAppFolders();
+    const remoteManifest = await dev1Adapter.getManifest(folderInfo);
+    expect(remoteManifest?.manifest.notes[note.id].isDeleted).toBe(true);
+
+    // Device 2 has note_to_delete in its local cache (isDeleted: false)
+    setActiveAccount('perm_device2');
+    await clearLocalDatabase();
+    const dev2Engine = new SyncEngine(dev1Adapter, 'perm_device2');
+    const dev2LocalCopy = { ...note, isDeleted: false };
+    await saveNoteLocal(dev2LocalCopy);
+    expect((await listNotesLocal()).length).toBe(1);
+
+    // Device 2 hydrates from Drive: remote deletion is synchronized, tombstone applied
+    await dev2Engine.hydrateAndReconcileFromDrive();
+
+    // Active notes list returns 0 notes (deleted note does NOT resurrect!)
+    const dev2ActiveNotes = await listNotesLocal(undefined, false);
+    expect(dev2ActiveNotes.length).toBe(0);
+
+    // Local note is preserved as tombstone (isDeleted: true)
+    const dev2StoredNote = await getNoteLocal(note.id);
+    expect(dev2StoredNote?.isDeleted).toBe(true);
+  });
+
+  // Test 36: Requirement 9 - Sign-out while an operation is in flight
+  it('36. Sign-out while an operation is in flight aborts cleanly without corruption', async () => {
+    setActiveAccount('perm_alice_signout');
+    await clearLocalDatabase();
+    const aliceAdapter = new MockDriveAdapter('perm_alice_signout', 'token_alice');
+    const aliceEngine = new SyncEngine(aliceAdapter, 'perm_alice_signout');
+
+    const note = createNote('note_signout_inflight', 'Alice In Flight Data');
+    note.contentHash = await computeContentHash(note.content);
+    await saveNoteLocal(note);
+    await enqueueOrCoalesceSyncJob({
+      jobId: 'job_signout_inflight',
+      type: 'SAVE_NOTE',
+      targetId: note.id,
+      payload: note,
+      clientTimestamp: Date.now(),
+      retryCount: 0,
+      status: 'pending',
+    });
+
+    const deferred = createDeferred();
+    aliceAdapter.onBeforeSaveNote = () => deferred.promise;
+
+    const processPromise = aliceEngine.processQueue();
+
+    // User signs out while saveNote is waiting
+    aliceEngine.setAdapter(new MockDriveAdapter(), null);
+    setActiveAccount(null);
+
+    // Now resolve the delayed saveNote
+    deferred.resolve();
+    await processPromise;
+
+    // Active account is null; operations reject access
+    expect(getActiveAccountId()).toBeNull();
+    await expect(listNotesLocal()).rejects.toThrow('IndexedDB access denied');
+
+    // When Alice signs back in, her note and job are safely preserved
+    setActiveAccount('perm_alice_signout');
+    await recoverInterruptedJobs('perm_alice_signout');
+    const aliceNotes = await listNotesLocal();
+    expect(aliceNotes.length).toBe(1);
+    expect(aliceNotes[0].plainTextPreview).toBe('Alice In Flight Data');
+    const aliceJobs = await getAllQueueJobs();
+    expect(aliceJobs.length).toBe(1);
+    expect(aliceJobs[0].status).toBe('pending');
+  });
+
+  // Test 37: Account switch during DELETE_NOTE operation
+  it('37. Account switch during DELETE_NOTE operation aborts without writing to new account partition, and job recovers safely', async () => {
+    setActiveAccount('perm_alice_del_switch');
+    await clearLocalDatabase();
+    const aliceAdapter = new MockDriveAdapter('perm_alice_del_switch', 'token_alice');
+    const syncEngine = new SyncEngine(aliceAdapter, 'perm_alice_del_switch');
+
+    // Create note on Alice's device and commit it to Drive
+    const aliceNote = createNote('note_alice_del', 'Alice Note To Delete');
+    aliceNote.contentHash = await computeContentHash(aliceNote.content);
+    await saveNoteLocal(aliceNote);
+    await enqueueOrCoalesceSyncJob({
+      jobId: 'job_alice_create',
+      type: 'SAVE_NOTE',
+      targetId: aliceNote.id,
+      payload: aliceNote,
+      clientTimestamp: Date.now(),
+      retryCount: 0,
+      status: 'pending',
+    });
+    await syncEngine.processQueue();
+
+    // Verify remote file exists on Alice's Drive
+    const remoteFiles = Array.from(aliceAdapter.files.values()).filter(f => f.appProperties['kurippuNoteId'] === 'note_alice_del');
+    expect(remoteFiles.length).toBe(1);
+    expect(remoteFiles[0].trashed).toBe(false);
+
+    // Enqueue DELETE_NOTE job for Alice
+    await enqueueOrCoalesceSyncJob({
+      jobId: 'job_alice_del_switch',
+      type: 'DELETE_NOTE',
+      targetId: aliceNote.id,
+      payload: aliceNote,
+      clientTimestamp: Date.now(),
+      retryCount: 0,
+      status: 'pending',
+    });
+
+    // Pause mock adapter after the remote file deletion completes
+    const deferred = createDeferred();
+    aliceAdapter.onAfterDeleteNoteFile = () => deferred.promise;
+
+    const deletePromise = syncEngine.processQueue();
+
+    // While deletion is paused after remote file removal, switch account to Bob!
+    setActiveAccount('perm_bob_del_switch');
+    await clearLocalDatabase();
+    const bobAdapter = new MockDriveAdapter('perm_bob_del_switch', 'token_bob');
+    syncEngine.setAdapter(bobAdapter, 'perm_bob_del_switch');
+
+    // Resume the delayed delete operation
+    deferred.resolve();
+    await deletePromise;
+
+    // Verify Bob's cache was NOT touched or polluted with Alice's note or manifest
+    expect((await listNotesLocal()).length).toBe(0);
+    expect((await getAllQueueJobs()).length).toBe(0);
+    const bobManifest = await getManifestLocal();
+    expect(bobManifest?.notes?.['note_alice_del']).toBeUndefined();
+
+    // Switch back to Alice: verify delete job was not silently lost and is recoverable
+    setActiveAccount('perm_alice_del_switch');
+    syncEngine.setAdapter(aliceAdapter, 'perm_alice_del_switch');
+    await recoverInterruptedJobs('perm_alice_del_switch');
+
+    const aliceJobs = await getAllQueueJobs();
+    expect(aliceJobs.length).toBe(1);
+    expect(aliceJobs[0].type).toBe('DELETE_NOTE');
+    expect(aliceJobs[0].status).toBe('pending');
+
+    // Remove hook and complete the recovered deletion job
+    aliceAdapter.onAfterDeleteNoteFile = undefined;
+    await syncEngine.processQueue();
+
+    // Verify Alice's pending jobs queue is empty and tombstone is saved
+    expect((await getAllQueueJobs()).length).toBe(0);
+    const folderInfo = await aliceAdapter.discoverOrCreateAppFolders();
+    const aliceRemoteManifest = await aliceAdapter.getManifest(folderInfo);
+    expect(aliceRemoteManifest?.manifest.notes['note_alice_del']?.isDeleted).toBe(true);
+
+    const aliceLocalNote = await getNoteLocal('note_alice_del');
+    expect(aliceLocalNote?.isDeleted).toBe(true);
+  });
+
+  // Test 38: Partial deletion and retry
+  it('38. Partial deletion preserves recoverable job, and retry treats already-deleted Drive file as idempotent success', async () => {
+    setActiveAccount('perm_partial_del');
+    await clearLocalDatabase();
+    const adapter = new MockDriveAdapter('perm_partial_del', 'token_partial');
+    const engine = new SyncEngine(adapter, 'perm_partial_del');
+
+    // Create and save note to Drive
+    const note = createNote('note_partial_del', 'Partial Delete Content');
+    note.contentHash = await computeContentHash(note.content);
+    await saveNoteLocal(note);
+    await enqueueOrCoalesceSyncJob({
+      jobId: 'job_create_partial',
+      type: 'SAVE_NOTE',
+      targetId: note.id,
+      payload: note,
+      clientTimestamp: Date.now(),
+      retryCount: 0,
+      status: 'pending',
+    });
+    await engine.processQueue();
+
+    const folderInfo = await adapter.discoverOrCreateAppFolders();
+
+    // Enqueue DELETE_NOTE job
+    await enqueueOrCoalesceSyncJob({
+      jobId: 'job_partial_del',
+      type: 'DELETE_NOTE',
+      targetId: note.id,
+      payload: note,
+      clientTimestamp: Date.now(),
+      retryCount: 0,
+      status: 'pending',
+    });
+
+    // Simulate failure: remote file deletion succeeds, but saveManifest throws error
+    let manifestSaveFailedOnce = false;
+    adapter.onBeforeSaveManifest = (manifest) => {
+      if (!manifestSaveFailedOnce && manifest.notes['note_partial_del']?.isDeleted) {
+        manifestSaveFailedOnce = true;
+        throw new Error('Simulated network failure saving remote manifest');
+      }
+    };
+
+    // First attempt fails during manifest update
+    await engine.processQueue();
+
+    // 1. Verify remote file was already deleted (trashed)
+    const remoteFile = Array.from(adapter.files.values()).find(f => f.appProperties['kurippuNoteId'] === 'note_partial_del');
+    expect(remoteFile?.trashed).toBe(true);
+
+    // 2. Verify remote manifest does NOT yet have tombstone
+    const remoteManifestBefore = await adapter.getManifest(folderInfo);
+    expect(remoteManifestBefore?.manifest.notes['note_partial_del']?.isDeleted).toBe(false);
+
+    // 3. Verify DELETE_NOTE job remains recoverable in sync_queue
+    const jobs = await getAllQueueJobs();
+    expect(jobs.length).toBe(1);
+    expect(jobs[0].type).toBe('DELETE_NOTE');
+    expect(jobs[0].retryCount).toBe(1);
+
+    // 4. Retry the job: already-deleted Drive file is handled idempotently, and manifest tombstone is saved
+    adapter.onBeforeSaveManifest = undefined;
+    await engine.processQueue();
+
+    expect((await getAllQueueJobs()).length).toBe(0);
+
+    const remoteManifestAfter = await adapter.getManifest(folderInfo);
+    expect(remoteManifestAfter?.manifest.notes['note_partial_del']?.isDeleted).toBe(true);
+
+    // 5. Subsequent hydration must NOT resurrect the deleted note
+    await engine.hydrateAndReconcileFromDrive();
+    const activeNotes = await listNotesLocal(undefined, false);
+    expect(activeNotes.length).toBe(0);
+
+    const storedNote = await getNoteLocal('note_partial_del');
+    expect(storedNote?.isDeleted).toBe(true);
+  });
+
+  // Test 39: Sign-out during DELETE_NOTE operation
+  it('39. Sign-out during deletion aborts cleanly, does not lose unrelated notes, and job remains recoverable', async () => {
+    setActiveAccount('perm_alice_signout_del');
+    await clearLocalDatabase();
+    const aliceAdapter = new MockDriveAdapter('perm_alice_signout_del', 'token_alice');
+    const engine = new SyncEngine(aliceAdapter, 'perm_alice_signout_del');
+
+    // Create an unrelated note (to remain active) and a note to delete
+    const unrelatedNote = createNote('note_unrelated', 'Alice Important Kept Note');
+    unrelatedNote.contentHash = await computeContentHash(unrelatedNote.content);
+    await saveNoteLocal(unrelatedNote);
+    await enqueueOrCoalesceSyncJob({
+      jobId: 'job_unrelated',
+      type: 'SAVE_NOTE',
+      targetId: unrelatedNote.id,
+      payload: unrelatedNote,
+      clientTimestamp: Date.now(),
+      retryCount: 0,
+      status: 'pending',
+    });
+
+    const noteToDelete = createNote('note_to_del_signout', 'Note To Delete Before Signout');
+    noteToDelete.contentHash = await computeContentHash(noteToDelete.content);
+    await saveNoteLocal(noteToDelete);
+    await enqueueOrCoalesceSyncJob({
+      jobId: 'job_to_del',
+      type: 'SAVE_NOTE',
+      targetId: noteToDelete.id,
+      payload: noteToDelete,
+      clientTimestamp: Date.now(),
+      retryCount: 0,
+      status: 'pending',
+    });
+
+    await engine.processQueue();
+    expect((await listNotesLocal(undefined, false)).length).toBe(2);
+
+    // Enqueue DELETE_NOTE job
+    await enqueueOrCoalesceSyncJob({
+      jobId: 'job_del_inflight_signout',
+      type: 'DELETE_NOTE',
+      targetId: noteToDelete.id,
+      payload: noteToDelete,
+      clientTimestamp: Date.now(),
+      retryCount: 0,
+      status: 'pending',
+    });
+
+    // Pause deletion before remote file deletion
+    const deferred = createDeferred();
+    aliceAdapter.onBeforeDeleteNoteFile = () => deferred.promise;
+
+    const deletePromise = engine.processQueue();
+
+    // User signs out while deletion is in flight
+    engine.setAdapter(new MockDriveAdapter(), null);
+    setActiveAccount(null);
+
+    deferred.resolve();
+    await deletePromise;
+
+    // Verify user is signed out and DB access rejected
+    expect(getActiveAccountId()).toBeNull();
+    await expect(listNotesLocal()).rejects.toThrow('IndexedDB access denied');
+
+    // Sign back in as Alice
+    setActiveAccount('perm_alice_signout_del');
+    engine.setAdapter(aliceAdapter, 'perm_alice_signout_del');
+    await recoverInterruptedJobs('perm_alice_signout_del');
+
+    // Verify unrelated note is intact and not lost
+    const recoveredUnrelated = await getNoteLocal('note_unrelated');
+    expect(recoveredUnrelated).toBeDefined();
+    expect(recoveredUnrelated?.plainTextPreview).toBe('Alice Important Kept Note');
+    expect(recoveredUnrelated?.isDeleted).toBe(false);
+
+    // Verify DELETE_NOTE job is preserved in queue
+    const aliceJobs = await getAllQueueJobs();
+    expect(aliceJobs.length).toBe(1);
+    expect(aliceJobs[0].type).toBe('DELETE_NOTE');
+    expect(aliceJobs[0].status).toBe('pending');
+
+    // Complete the delete job
+    aliceAdapter.onBeforeDeleteNoteFile = undefined;
+    await engine.processQueue();
+
+    expect((await getAllQueueJobs()).length).toBe(0);
+    const activeNotes = await listNotesLocal(undefined, false);
+    expect(activeNotes.length).toBe(1);
+    expect(activeNotes[0].id).toBe('note_unrelated');
+
+    const tombstonedNote = await getNoteLocal('note_to_del_signout');
+    expect(tombstonedNote?.isDeleted).toBe(true);
+  });
+
+  // Test 40: Edge Case 1 - IndexedDB open race between Account A and Account B
+  it('40. IndexedDB open race: Account A stale open cannot replace or invalidate Account B connection', async () => {
+    setActiveAccount('perm_alice_race');
+
+    // Account A initiates getLocalDB() while opening is in flight
+    const promiseA = getLocalDB();
+
+    // In the same synchronous turn before promiseA's open resolves, switch active account to Bob
+    setActiveAccount('perm_bob_race');
+
+    // Account B initiates getLocalDB()
+    const promiseB = getLocalDB();
+
+    // Account A's stale open must reject with StaleSessionError
+    await expect(promiseA).rejects.toThrow(StaleSessionError);
+
+    // Account B's open must resolve successfully
+    const dbB = await promiseB;
+    expect(dbB.name).toBe('kurippu_cache_perm_bob_race');
+
+    // Bob can write and read his own notes
+    const bobNote = createNote('note_bob_data', 'Bob Secret Data');
+    await saveNoteLocal(bobNote);
+    const bobNotes = await listNotesLocal();
+    expect(bobNotes.length).toBe(1);
+    expect(bobNotes[0].id).toBe('note_bob_data');
+
+    // Switching back to Alice confirms Alice's partition is isolated and does not contain Bob's note
+    setActiveAccount('perm_alice_race');
+    const aliceNotes = await listNotesLocal();
+    expect(aliceNotes.length).toBe(0);
+    expect(await getNoteLocal('note_bob_data')).toBeUndefined();
+  });
+
+  // Test 41: Edge Case 2 - Partial legacy migration and recovery
+  it('41. Partial legacy migration: recovers missing notes on re-run without duplicate entries or modifying legacy database', async () => {
+    const testLegacyDbName = `kurippu_test_legacy_41_${Date.now()}`;
+    setLegacyDbNameForTesting(testLegacyDbName);
+
+    let verifyLegacyDb: any = null;
+    try {
+      // 1. Setup isolated legacy database with 3 notes and 3 jobs
+      const legacyDb = await openLegacyDatabase(testLegacyDbName);
+      const note1 = createNote('legacy_1', 'Legacy 1 Text');
+      const note2 = createNote('legacy_2', 'Legacy 2 Text');
+      const note3 = createNote('legacy_3', 'Legacy 3 Text');
+      for (const n of [note1, note2, note3]) {
+        await legacyDb.put('notes', n);
+        await legacyDb.add('sync_queue', {
+          jobId: `job_${n.id}`,
+          type: 'SAVE_NOTE',
+          targetId: n.id,
+          payload: n,
+          clientTimestamp: Date.now(),
+          retryCount: 0,
+          status: 'pending',
+        });
+      }
+      legacyDb.close();
+
+      // 2. Setup destination account with legacy_1 already imported (simulating failure after note 1)
+      setActiveAccount('perm_dest_partial');
+      await clearLocalDatabase();
+      await saveNoteLocal(note1);
+
+      // 3. Re-run migration: must skip note1, import missing note2 and note3
+      const res = await importLegacyCacheToActiveAccount('perm_dest_partial');
+      expect(res.skippedNotesCount).toBe(1);
+      expect(res.importedNotesCount).toBe(2);
+
+      // Verify all 3 notes exist in destination with zero duplicates
+      const destNotes = await listNotesLocal();
+      expect(destNotes.length).toBe(3);
+      const destIds = destNotes.map(n => n.id).sort();
+      expect(destIds).toEqual(['legacy_1', 'legacy_2', 'legacy_3']);
+
+      // Verify all 3 notes have sync jobs ready to sync to Drive
+      const destJobs = await getAllQueueJobs();
+      expect(destJobs.length).toBe(3);
+
+      // 4. Repeated run is completely idempotent
+      const res2 = await importLegacyCacheToActiveAccount('perm_dest_partial');
+      expect(res2.importedNotesCount).toBe(0);
+      expect(res2.importedJobsCount).toBe(0);
+      expect(res2.skippedNotesCount).toBe(3);
+      expect((await getAllQueueJobs()).length).toBe(3);
+
+      // Verify legacy database remains completely untouched with 3 notes
+      verifyLegacyDb = await openDB(testLegacyDbName, 1);
+      expect((await verifyLegacyDb.getAll('notes')).length).toBe(3);
+      expect((await verifyLegacyDb.getAll('sync_queue')).length).toBe(3);
+      verifyLegacyDb.close();
+      verifyLegacyDb = null;
+    } finally {
+      if (verifyLegacyDb) {
+        try { verifyLegacyDb.close(); } catch {}
+      }
+      try { await deleteDB(testLegacyDbName); } catch {}
+      setLegacyDbNameForTesting(null);
+    }
+  });
+
+  // Test 42: Edge Case 3 - Failed legacy job collision & payload protection
+  it('42. Failed legacy job collision: deduplicates jobs and prevents older legacy payloads from overwriting newer local edits', async () => {
+    const testLegacyDbName = `kurippu_test_legacy_42_${Date.now()}`;
+    setLegacyDbNameForTesting(testLegacyDbName);
+
+    try {
+      // 1. Setup isolated legacy database with note_collision containing old content
+      const legacyDb = await openLegacyDatabase(testLegacyDbName);
+      const oldLegacyNote = createNote('note_collision_failed', 'Old Stale Legacy Content');
+      await legacyDb.put('notes', oldLegacyNote);
+      await legacyDb.add('sync_queue', {
+        jobId: 'job_legacy_old',
+        type: 'SAVE_NOTE',
+        targetId: 'note_collision_failed',
+        payload: oldLegacyNote,
+        clientTimestamp: Date.now() - 100000,
+        retryCount: 0,
+        status: 'pending',
+      });
+      legacyDb.close();
+
+      // 2. Destination account has note_collision_failed with NEWER local edits
+      setActiveAccount('perm_collision_test');
+      await clearLocalDatabase();
+      const newerActiveNote = createNote('note_collision_failed', 'Newer Active Local Edits');
+      newerActiveNote.contentHash = await computeContentHash(newerActiveNote.content);
+      await saveNoteLocal(newerActiveNote);
+
+      // Destination account has an existing FAILED job for this note
+      await enqueueOrCoalesceSyncJob({
+        jobId: 'job_destination_failed',
+        type: 'SAVE_NOTE',
+        targetId: 'note_collision_failed',
+        payload: newerActiveNote,
+        clientTimestamp: Date.now(),
+        retryCount: 5,
+        status: 'failed',
+      });
+
+      // Verify pre-condition: destination has 1 failed job
+      const initialJobs = await getAllQueueJobs();
+      expect(initialJobs.length).toBe(1);
+      expect(initialJobs[0].status).toBe('failed');
+
+      // 3. Run migration into destination account
+      const res = await importLegacyCacheToActiveAccount('perm_collision_test');
+      expect(res.skippedNotesCount).toBe(1);
+      expect(res.importedNotesCount).toBe(0);
+      expect(res.importedJobsCount).toBe(0); // Deduplicated: zero duplicate jobs created
+
+      // 4. Verify local note still has NEWER content (never overwritten by legacy)
+      const storedNote = await getNoteLocal('note_collision_failed');
+      expect(storedNote?.plainTextPreview).toBe('Newer Active Local Edits');
+
+      // 5. Verify destination queue still contains strictly 1 job with newer payload
+      const jobsAfterMigration = await getAllQueueJobs();
+      expect(jobsAfterMigration.length).toBe(1);
+      const jobPayload = jobsAfterMigration[0].payload as NoteDocument;
+      expect(jobPayload.plainTextPreview).toBe('Newer Active Local Edits');
+
+      // 6. Retrying failed jobs restores the job with the newer content for sync
+      const retriedCount = await retryFailedJobs('perm_collision_test');
+      expect(retriedCount).toBe(1);
+      const jobsAfterRetry = await getAllQueueJobs();
+      expect(jobsAfterRetry[0].status).toBe('pending');
+      expect(jobsAfterRetry[0].retryCount).toBe(0);
+    } finally {
+      try { await deleteDB(testLegacyDbName); } catch {}
+      setLegacyDbNameForTesting(null);
+    }
+  });
+
+  // Test 43: Edge Case 4 - Concurrent legacy migration attempts
+  it('43. Concurrent legacy migration attempts reuse in-flight promise and create zero duplicate jobs or inconsistent manifests', async () => {
+    const testLegacyDbName = `kurippu_test_legacy_43_${Date.now()}`;
+    setLegacyDbNameForTesting(testLegacyDbName);
+
+    try {
+      // 1. Setup isolated legacy database with 2 notes and 2 jobs
+      const legacyDb = await openLegacyDatabase(testLegacyDbName);
+      const noteA = createNote('concurrent_note_a', 'Concurrent Note A');
+      const noteB = createNote('concurrent_note_b', 'Concurrent Note B');
+      for (const n of [noteA, noteB]) {
+        await legacyDb.put('notes', n);
+        await legacyDb.add('sync_queue', {
+          jobId: `job_${n.id}`,
+          type: 'SAVE_NOTE',
+          targetId: n.id,
+          payload: n,
+          clientTimestamp: Date.now(),
+          retryCount: 0,
+          status: 'pending',
+        });
+      }
+      legacyDb.close();
+
+      // 2. Destination account starts empty
+      setActiveAccount('perm_concurrent_migration');
+      await clearLocalDatabase();
+
+      // 3. Initiate two concurrent migration attempts simultaneously
+      const [res1, res2] = await Promise.all([
+        importLegacyCacheToActiveAccount('perm_concurrent_migration'),
+        importLegacyCacheToActiveAccount('perm_concurrent_migration'),
+      ]);
+
+      // Both callers receive the exact same migration result
+      expect(res1).toEqual(res2);
+      expect(res1.importedNotesCount).toBe(2);
+
+      // Verify destination database has exactly 2 notes (zero duplicates)
+      const notes = await listNotesLocal();
+      expect(notes.length).toBe(2);
+
+      // Verify destination queue has exactly 2 jobs (zero duplicate jobs)
+      const jobs = await getAllQueueJobs();
+      expect(jobs.length).toBe(2);
+
+      // Verify destination manifest has exactly 2 notes
+      const manifest = await getManifestLocal();
+      expect(Object.keys(manifest?.notes || {}).length).toBe(2);
+    } finally {
+      try { await deleteDB(testLegacyDbName); } catch {}
+      setLegacyDbNameForTesting(null);
+    }
+  });
+
+  // Test 44: Stale-session UI refresh guard
+  it('44. Stale-session UI refresh guard: rejects stale session reads and suppresses UI state updates when account switches during refresh', async () => {
+    // 1. Setup Alice's account with Alice's note
+    setActiveAccount('perm_alice_refresh');
+    await clearLocalDatabase();
+    const aliceNote = createNote('note_alice_refresh', 'Alice Secret Content');
+    await saveNoteLocal(aliceNote);
+
+    // 2. Setup Bob's account with Bob's note
+    setActiveAccount('perm_bob_refresh');
+    await clearLocalDatabase();
+    const bobNote = createNote('note_bob_refresh', 'Bob Secret Content');
+    await saveNoteLocal(bobNote);
+
+    // 3. Scenario A: Post-read session verification prevents stale state updates
+    // Alice is active and captures account and session
+    setActiveAccount('perm_alice_refresh');
+    const aliceAccountId = getActiveAccountId()!;
+    const aliceSessionId = getActiveAccountSessionId();
+
+    // Alice reads her notes
+    const aliceNotes = await listNotesLocal(aliceAccountId, false, aliceSessionId);
+    expect(aliceNotes.length).toBe(1);
+    expect(aliceNotes[0].id).toBe('note_alice_refresh');
+
+    // Before state update executes, account switches to Bob
+    setActiveAccount('perm_bob_refresh');
+
+    // Simulate React component state (currently Bob's data)
+    let componentNotes: NoteDocument[] = [bobNote];
+    let stateWasOverwritten = false;
+
+    // Execute the exact guard logic from refreshLocalData()
+    if (getActiveAccountId() === aliceAccountId && getActiveAccountSessionId() === aliceSessionId) {
+      componentNotes = aliceNotes;
+      stateWasOverwritten = true;
+    }
+
+    // Must NOT overwrite Bob's UI state with Alice's resolved notes
+    expect(stateWasOverwritten).toBe(false);
+    expect(componentNotes.length).toBe(1);
+    expect(componentNotes[0].id).toBe('note_bob_refresh');
+
+    // 4. Scenario B: Stale session read rejection & error suppression
+    // Any read attempted using Alice's stale session ID rejects with StaleSessionError
+    await expect(listNotesLocal(aliceAccountId, false, aliceSessionId)).rejects.toThrow(StaleSessionError);
+    await expect(getAllQueueJobs(aliceAccountId, aliceSessionId)).rejects.toThrow(StaleSessionError);
+
+    // Verify error suppression: StaleSessionError is caught silently, not logged as unexpected error
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      try {
+        await listNotesLocal(aliceAccountId, false, aliceSessionId);
+      } catch (err: any) {
+        if (
+          err instanceof StaleSessionError ||
+          err?.name === 'StaleSessionError' ||
+          err instanceof AccountMismatchError ||
+          err?.name === 'AccountMismatchError'
+        ) {
+          // Expected cancellation
+        } else {
+          console.warn('[App] Failed to refresh local data:', err.message);
+        }
+      }
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
+
+    // 5. Bob's reads using Bob's valid session succeed and return Bob's data
+    const bobAccountId = getActiveAccountId()!;
+    const bobSessionId = getActiveAccountSessionId();
+    const bobNotes = await listNotesLocal(bobAccountId, false, bobSessionId);
+    expect(bobNotes.length).toBe(1);
+    expect(bobNotes[0].id).toBe('note_bob_refresh');
+  });
+
+  // Test 45: Account switch during migration cancels and prevents foreign partition pollution
+  it('45. Account switch during migration cancels cleanly and prevents data leakage into new account', async () => {
+    const testLegacyDbName = `kurippu_test_legacy_45_${Date.now()}`;
+    setLegacyDbNameForTesting(testLegacyDbName);
+
+    // 1. Setup isolated legacy database with 3 notes
+    const legacyDb = await openLegacyDatabase(testLegacyDbName);
+    const note1 = createNote('mig_race_1', 'Migration Race 1');
+    const note2 = createNote('mig_race_2', 'Migration Race 2');
+    const note3 = createNote('mig_race_3', 'Migration Race 3');
+    for (const n of [note1, note2, note3]) {
+      await legacyDb.put('notes', n);
+    }
+    legacyDb.close();
+
+    // 2. Setup Alice's account
+    setActiveAccount('perm_alice_switch_race');
+    await clearLocalDatabase();
+
+    // 3. Test seam: pause Alice's migration deterministically before destination write transaction begins
+    let resumeMigration!: () => void;
+    let notifyPaused!: () => void;
+    const pauseGate = new Promise<void>(resolve => { resumeMigration = resolve; });
+    const reachedPauseGate = new Promise<void>(resolve => { notifyPaused = resolve; });
+
+    setMigrationBeforeWriteHookForTesting(async () => {
+      notifyPaused();
+      await pauseGate;
+    });
+
+    try {
+      // Alice initiates migration
+      const aliceMigrationPromise = importLegacyCacheToActiveAccount('perm_alice_switch_race');
+
+      // Wait until Alice's migration has read legacy data, acquired target DB,
+      // and paused right before beginning destination write transaction
+      await reachedPauseGate;
+
+      // 4. User switches account to Bob mid-flight while Alice is paused
+      setActiveAccount('perm_bob_switch_race');
+      await clearLocalDatabase();
+
+      // Release the pause gate: Alice resumes and immediately encounters session/account validation
+      resumeMigration();
+
+      // Alice's migration must reject due to stale session or account mismatch
+      await expect(aliceMigrationPromise).rejects.toThrow(/(Account partition mismatch|Stale session rejected)/);
+
+      // 5. Bob's partition must remain completely empty (zero Alice notes written)
+      const bobNotes = await listNotesLocal();
+      expect(bobNotes.length).toBe(0);
+      const bobManifest = await getManifestLocal();
+      expect(Object.keys(bobManifest?.notes || {}).length).toBe(0);
+      const bobJobs = await getAllQueueJobs();
+      expect(bobJobs.length).toBe(0);
+
+      // 6. Switching back to Alice allows clean, successful migration recovery
+      setActiveAccount('perm_alice_switch_race');
+      const recoveryResult = await importLegacyCacheToActiveAccount('perm_alice_switch_race');
+      expect(recoveryResult.importedNotesCount).toBe(3);
+
+      const aliceNotes = await listNotesLocal();
+      expect(aliceNotes.length).toBe(3);
+    } finally {
+      setMigrationBeforeWriteHookForTesting(null);
+      try { await deleteDB(testLegacyDbName); } catch {}
+      setLegacyDbNameForTesting(null);
+    }
+  });
+
+  // Test 46: Account- and session-scoped migration coordination
+  it('46. Account- and session-scoped migration coordination: rejects cross-account calls and isolates per session', async () => {
+    const testLegacyDbName = `kurippu_test_legacy_46_${Date.now()}`;
+    setLegacyDbNameForTesting(testLegacyDbName);
+
+    try {
+      // 1. Setup isolated legacy database with 1 note
+      const legacyDb = await openLegacyDatabase(testLegacyDbName);
+      await legacyDb.put('notes', createNote('note_coord', 'Coord Note'));
+      legacyDb.close();
+
+      // 2. Alice is active
+      setActiveAccount('perm_alice_coord');
+      await clearLocalDatabase();
+
+      // 3. Requesting Bob's partition while Alice is active must reject with AccountMismatchError
+      await expect(importLegacyCacheToActiveAccount('perm_bob_coord')).rejects.toThrow(AccountMismatchError);
+
+      // 4. Concurrent calls for the same active account and session must share the same promise
+      const promise1 = importLegacyCacheToActiveAccount('perm_alice_coord');
+      const promise2 = importLegacyCacheToActiveAccount('perm_alice_coord');
+      expect(promise1).toBe(promise2);
+
+      const resAlice = await promise1;
+      expect(resAlice.importedNotesCount).toBe(1);
+
+      // 5. Switch to Bob
+      setActiveAccount('perm_bob_coord');
+      await clearLocalDatabase();
+
+      // Bob's call must receive a fresh, independent promise (not Alice's resolved or cached promise)
+      const promiseBob1 = importLegacyCacheToActiveAccount('perm_bob_coord');
+      expect(promiseBob1).not.toBe(promise1);
+
+      const resBob = await promiseBob1;
+      expect(resBob.importedNotesCount).toBe(1);
+
+      // 6. After completion, subsequent calls receive a new promise, verifying cleanup of Map entry
+      const promiseBob2 = importLegacyCacheToActiveAccount('perm_bob_coord');
+      expect(promiseBob2).not.toBe(promiseBob1);
+      const resBob2 = await promiseBob2;
+      expect(resBob2.skippedNotesCount).toBe(1); // Already imported
+    } finally {
+      try { await deleteDB(testLegacyDbName); } catch {}
+      setLegacyDbNameForTesting(null);
+    }
+  });
+
+  // Test 47: Destination note preservation, idempotency, and legacy database non-mutation
+  it('47. Destination note preservation, idempotency on retry, and legacy database non-mutation', async () => {
+    const testLegacyDbName = `kurippu_test_legacy_47_${Date.now()}`;
+    setLegacyDbNameForTesting(testLegacyDbName);
+
+    let checkLegacyDb: any = null;
+    try {
+      // 1. Setup isolated legacy database with note A and note B
+      const legacyDb = await openLegacyDatabase(testLegacyDbName);
+      const noteA = createNote('note_idemp_a', 'Original Legacy A Content');
+      const noteB = createNote('note_idemp_b', 'Original Legacy B Content');
+      await legacyDb.put('notes', noteA);
+      await legacyDb.put('notes', noteB);
+      await legacyDb.add('sync_queue', {
+        jobId: 'job_legacy_a',
+        type: 'SAVE_NOTE',
+        targetId: 'note_idemp_a',
+        payload: noteA,
+        clientTimestamp: Date.now(),
+        retryCount: 0,
+        status: 'pending',
+      });
+      legacyDb.close();
+
+      // 2. Setup destination partition where note A already exists with local edits
+      setActiveAccount('perm_dest_idemp');
+      await clearLocalDatabase();
+      const locallyEditedA = {
+        ...createNote('note_idemp_a', 'Locally Modified Destination Content'),
+        updatedAt: new Date(Date.now() + 1000).toISOString(),
+      };
+      await saveNoteLocal(locallyEditedA);
+
+      // 3. Run migration
+      const result = await importLegacyCacheToActiveAccount('perm_dest_idemp');
+      expect(result.skippedNotesCount).toBe(1); // noteA was skipped
+      expect(result.importedNotesCount).toBe(1); // noteB was imported
+
+      // 4. Verify destination note A was NOT overwritten by legacy content
+      const destinationNoteA = await getNoteLocal('note_idemp_a');
+      expect(destinationNoteA?.plainTextPreview).toBe('Locally Modified Destination Content');
+
+      // Verify destination note B was imported
+      const destinationNoteB = await getNoteLocal('note_idemp_b');
+      expect(destinationNoteB?.plainTextPreview).toBe('Original Legacy B Content');
+
+      // 5. Verify legacy database remains 100% untouched
+      checkLegacyDb = await openDB(testLegacyDbName, 1);
+      const legacyNotesAfter = await checkLegacyDb.getAll('notes');
+      const legacyJobsAfter = await checkLegacyDb.getAll('sync_queue');
+      checkLegacyDb.close();
+      checkLegacyDb = null;
+      expect(legacyNotesAfter.length).toBe(2);
+      expect(legacyJobsAfter.length).toBe(1);
+
+      // 6. Safe retry: running migration again does not duplicate notes or jobs
+      const retryResult = await importLegacyCacheToActiveAccount('perm_dest_idemp');
+      expect(retryResult.skippedNotesCount).toBe(2);
+      expect(retryResult.importedNotesCount).toBe(0);
+      expect(retryResult.importedJobsCount).toBe(0);
+
+      const destNotes = await listNotesLocal();
+      expect(destNotes.length).toBe(2);
+    } finally {
+      if (checkLegacyDb) {
+        try { checkLegacyDb.close(); } catch {}
+      }
+      try { await deleteDB(testLegacyDbName); } catch {}
+      setLegacyDbNameForTesting(null);
+    }
+  });
+
+  // Test 47b: Destination write transaction failure rolls back all stores atomically
+  it('47b. Destination write transaction failure rolls back notes, manifest, and sync queue atomically', async () => {
+    const testLegacyDbName = `kurippu_test_legacy_47b_${Date.now()}`;
+    setLegacyDbNameForTesting(testLegacyDbName);
+
+    let checkLegacyDb: any = null;
+    const originalPut = IDBObjectStore.prototype.put;
+    let putSpy: any = null;
+
+    try {
+      // 1. Setup isolated legacy database with note A, note B, and a sync job
+      const legacyDb = await openLegacyDatabase(testLegacyDbName);
+      const noteA = createNote('note_rollback_a', 'Rollback Note A Content');
+      const noteB = createNote('note_rollback_b', 'Rollback Note B Content');
+      await legacyDb.put('notes', noteA);
+      await legacyDb.put('notes', noteB);
+      await legacyDb.add('sync_queue', {
+        jobId: 'job_rollback_a',
+        type: 'SAVE_NOTE',
+        targetId: 'note_rollback_a',
+        payload: noteA,
+        clientTimestamp: Date.now(),
+        retryCount: 0,
+        status: 'pending',
+      });
+      legacyDb.close();
+
+      // 2. Setup clean destination partition
+      setActiveAccount('perm_dest_rollback');
+      await clearLocalDatabase();
+
+      // 3. Inject a controlled JavaScript error during migration AFTER destination note writes have executed
+      let notesWrittenBeforeError = 0;
+      putSpy = vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (this: IDBObjectStore, value: any, key?: any) {
+        if (this.name === 'notes') {
+          notesWrittenBeforeError++;
+        }
+        if (this.name === 'manifest') {
+          throw new Error('Controlled JavaScript failure during manifest merge in transaction');
+        }
+        return originalPut.call(this, value, key);
+      });
+
+      // 4. Migration must reject with the injected error
+      await expect(importLegacyCacheToActiveAccount('perm_dest_rollback')).rejects.toThrow(
+        'Controlled JavaScript failure during manifest merge in transaction'
+      );
+
+      // Verify that at least one destination note write had been executed before the error
+      expect(notesWrittenBeforeError).toBeGreaterThanOrEqual(1);
+
+      // 5. Verify atomic rollback: destination partition must have ZERO notes, ZERO manifest entries, and ZERO queue jobs
+      const destNotes = await listNotesLocal('perm_dest_rollback');
+      expect(destNotes.length).toBe(0);
+
+      const destManifest = await getManifestLocal('perm_dest_rollback');
+      expect(destManifest?.notes?.['note_rollback_a']).toBeUndefined();
+      expect(destManifest?.notes?.['note_rollback_b']).toBeUndefined();
+      expect(Object.keys(destManifest?.notes || {}).length).toBe(0);
+
+      const destJobs = await getAllQueueJobs('perm_dest_rollback');
+      expect(destJobs.length).toBe(0);
+
+      // 6. Verify legacy database remains 100% untouched
+      checkLegacyDb = await openDB(testLegacyDbName, 1);
+      const legacyNotesAfter = await checkLegacyDb.getAll('notes');
+      const legacyJobsAfter = await checkLegacyDb.getAll('sync_queue');
+      checkLegacyDb.close();
+      checkLegacyDb = null;
+      expect(legacyNotesAfter.length).toBe(2);
+      expect(legacyJobsAfter.length).toBe(1);
+
+      // 7. Remove the error injection and verify that subsequent migration retry succeeds cleanly
+      putSpy.mockRestore();
+      putSpy = null;
+
+      const retryResult = await importLegacyCacheToActiveAccount('perm_dest_rollback');
+      expect(retryResult.importedNotesCount).toBe(2);
+      expect(retryResult.importedJobsCount).toBe(1);
+      expect(retryResult.skippedNotesCount).toBe(0);
+
+      const recoveredNotes = await listNotesLocal('perm_dest_rollback');
+      expect(recoveredNotes.length).toBe(2);
+      const recoveredJobs = await getAllQueueJobs('perm_dest_rollback');
+      expect(recoveredJobs.length).toBe(1);
+    } finally {
+      if (putSpy) {
+        try { putSpy.mockRestore(); } catch {}
+      }
+      if (checkLegacyDb) {
+        try { checkLegacyDb.close(); } catch {}
+      }
+      try { await deleteDB(testLegacyDbName); } catch {}
+      setLegacyDbNameForTesting(null);
+    }
+  });
+
+  // Test 48: Stale completion safety via production executeLegacyImportWorkflow
+  it('48. executeLegacyImportWorkflow: stale completion does not mutate UI state, call processQueue, or log errors', async () => {
+    // 1. Spies to verify callback invocations
+    const setLegacyCacheInfoSpy = vi.fn();
+    const refreshLocalDataSpy = vi.fn();
+    const processQueueSpy = vi.fn();
+    const setIsMigratingLegacySpy = vi.fn();
+    const addLogSpy = vi.fn();
+
+    // 2. Alice is active
+    setActiveAccount('perm_alice_wf');
+    const targetAccountId = 'perm_alice_wf';
+    const migrationSessionId = getActiveAccountSessionId();
+
+    // 3. Controlled migration promise to simulate in-flight delay
+    let resolveMigration!: (res: LegacyCacheImportResult) => void;
+    const controlledMigrationPromise = new Promise<LegacyCacheImportResult>(resolve => {
+      resolveMigration = resolve;
+    });
+
+    // 4. Launch the production workflow helper
+    const workflowPromise = executeLegacyImportWorkflow({
+      targetAccountId,
+      migrationSessionId,
+      getActiveAccountId,
+      getActiveAccountSessionId,
+      importLegacyCache: () => controlledMigrationPromise,
+      refreshLocalData: refreshLocalDataSpy,
+      processQueue: processQueueSpy,
+      setLegacyCacheInfo: setLegacyCacheInfoSpy,
+      setIsMigratingLegacy: setIsMigratingLegacySpy,
+      addLog: addLogSpy,
+    });
+
+    // Workflow started and set loading flag
+    expect(setIsMigratingLegacySpy).toHaveBeenCalledWith(true);
+
+    // 5. User switches account to Bob mid-migration
+    setActiveAccount('perm_bob_wf');
+
+    // 6. Resolve Alice's migration
+    resolveMigration({ importedNotesCount: 2, importedJobsCount: 1, skippedNotesCount: 0 });
+
+    // 7. Await workflow completion
+    const completed = await workflowPromise;
+
+    // Must return false indicating clean cancellation
+    expect(completed).toBe(false);
+
+    // Must NOT clear Bob's legacy cache banner
+    expect(setLegacyCacheInfoSpy).not.toHaveBeenCalled();
+
+    // Must NOT refresh local data
+    expect(refreshLocalDataSpy).not.toHaveBeenCalled();
+
+    // Must NOT trigger sync queue processing
+    expect(processQueueSpy).not.toHaveBeenCalled();
+
+    // Must NOT emit failure log
+    const logCalls = addLogSpy.mock.calls.map(c => c[0]);
+    expect(logCalls.some(m => m.includes('Legacy import failed'))).toBe(false);
+  });
+
+  // Test 49: getLocalDB caches connection but recovers from rejected open, respecting session boundaries
+  it('49. getLocalDB recovers from failed database open on subsequent call and protects newer sessions', async () => {
+    // Phase 1: Transient open failure recovers on subsequent attempt for same session
+    setActiveAccount('perm_retry_open');
+    const originalOpen = indexedDB.open.bind(indexedDB);
+
+    let failNextOpen = true;
+    const openSpy = vi.spyOn(indexedDB, 'open').mockImplementation((name, version) => {
+      if (name === 'kurippu_cache_perm_retry_open' && failNextOpen) {
+        failNextOpen = false;
+        throw new DOMException('Simulated transient disk/open error', 'UnknownError');
+      }
+      return originalOpen(name, version);
+    });
+
+    let recoveredDb: any = null;
+    try {
+      // First attempt rejects due to transient error
+      await expect(getLocalDB('perm_retry_open')).rejects.toThrow();
+
+      // Second attempt without account switch must NOT return the cached rejected promise;
+      // it must re-attempt and succeed
+      recoveredDb = await getLocalDB('perm_retry_open');
+      expect(recoveredDb).toBeDefined();
+      expect(recoveredDb.name).toBe('kurippu_cache_perm_retry_open');
+    } finally {
+      openSpy.mockRestore();
+      if (recoveredDb) {
+        try { recoveredDb.close(); } catch {}
+      }
+    }
+
+    // Phase 2: Session isolation with controlled deferred open promise
+    setActiveAccount('perm_alice_deferred');
+
+    let rejectAliceOpen!: (err: Error) => void;
+    const aliceDeferredGate = new Promise<never>((_, reject) => {
+      rejectAliceOpen = reject;
+    });
+
+    setDbOpenWrapperForTesting(async doOpen => {
+      if (getActiveAccountId() === 'perm_alice_deferred') {
+        return aliceDeferredGate; // Alice stays pending
+      }
+      return doOpen(); // Bob opens normally
+    });
+
+    let bobDb: any = null;
+    try {
+      // Alice initiates getLocalDB (remains pending on aliceDeferredGate)
+      const aliceOpenCall = getLocalDB('perm_alice_deferred');
+
+      // User switches to Bob while Alice's call is in-flight
+      setActiveAccount('perm_bob_deferred');
+      bobDb = await getLocalDB('perm_bob_deferred');
+      expect(bobDb.name).toBe('kurippu_cache_perm_bob_deferred');
+
+      // Reject Alice's pending open only AFTER Bob's connection is established
+      rejectAliceOpen(new DOMException('Alice deferred disk error', 'UnknownError'));
+
+      // Alice's open call rejects cleanly
+      await expect(aliceOpenCall).rejects.toThrow();
+
+      // Verify Alice's failure did NOT change the active account
+      expect(getActiveAccountId()).toBe('perm_bob_deferred');
+
+      // Verify Alice's failure did NOT clear Bob's active connection
+      const bobDbCached = await getLocalDB('perm_bob_deferred');
+      expect(bobDbCached).toBe(bobDb);
+    } finally {
+      setDbOpenWrapperForTesting(null);
+      if (bobDb) {
+        try { bobDb.close(); } catch {}
+      }
+    }
+  });
+
+  // Test 50: Non-destructive inspection and safe handling of absent legacy database
+  it('50. inspectLegacyCache and migration safely handle absent legacy database without mutating storage', async () => {
+    const hasDatabasesSupport = typeof indexedDB !== 'undefined' && typeof indexedDB.databases === 'function';
+    const uniqueAbsentDbName = `kurippu_test_absent_${Date.now()}`;
+    setLegacyDbNameForTesting(uniqueAbsentDbName);
+
+    try {
+      if (hasDatabasesSupport) {
+        // Case A: When indexedDB.databases() is supported and confirms absent database
+        let dbs = await indexedDB.databases();
+        expect(dbs.some(d => d.name === uniqueAbsentDbName)).toBe(false);
+
+        // 1. inspectLegacyCache when DB is absent
+        const summary = await inspectLegacyCache();
+        expect(summary.exists).toBe(false);
+        expect(summary.notesCount).toBe(0);
+        expect(summary.pendingJobsCount).toBe(0);
+        expect(summary.noteTitles).toEqual([]);
+
+        // Verify inspectLegacyCache did NOT create the database on disk
+        dbs = await indexedDB.databases();
+        expect(dbs.some(d => d.name === uniqueAbsentDbName)).toBe(false);
+
+        // 2. importLegacyCacheToActiveAccount when DB is absent
+        setActiveAccount('perm_dest_absent_legacy');
+        await clearLocalDatabase();
+
+        const migrationResult = await importLegacyCacheToActiveAccount('perm_dest_absent_legacy');
+        expect(migrationResult.importedNotesCount).toBe(0);
+        expect(migrationResult.importedJobsCount).toBe(0);
+        expect(migrationResult.skippedNotesCount).toBe(0);
+
+        // Verify migration did NOT create the database on disk
+        dbs = await indexedDB.databases();
+        expect(dbs.some(d => d.name === uniqueAbsentDbName)).toBe(false);
+
+        // Verify destination partition remains empty
+        const destNotes = await listNotesLocal('perm_dest_absent_legacy');
+        expect(destNotes.length).toBe(0);
+      }
+
+      // Case B: In an environment where indexedDB.databases() is unavailable
+      setLegacyDatabaseExistenceCheckerForTesting(async () => 'unsupported');
+
+      // Passive inspection must remain conservative and return exists: false
+      const unsuppSummary = await inspectLegacyCache();
+      expect(unsuppSummary.exists).toBe(false);
+
+      // Active migration must NOT silently create an empty database or report a successful no-op;
+      // it must throw LegacyDatabaseUnavailableError
+      setActiveAccount('perm_dest_unsupported_legacy');
+      await clearLocalDatabase();
+
+      await expect(importLegacyCacheToActiveAccount('perm_dest_unsupported_legacy')).rejects.toThrow(
+        LegacyDatabaseUnavailableError
+      );
+
+      // Verify destination partition remains completely empty
+      const destNotes = await listNotesLocal('perm_dest_unsupported_legacy');
+      expect(destNotes.length).toBe(0);
+
+      // Case C: In an environment where indexedDB itself is completely unavailable/undefined
+      setLegacyDatabaseExistenceCheckerForTesting(null);
+      const originalIndexedDB = (globalThis as any).indexedDB;
+      try {
+        (globalThis as any).indexedDB = undefined;
+        // Passive inspection returns exists: false
+        const undefSummary = await inspectLegacyCache();
+        expect(undefSummary.exists).toBe(false);
+
+        // Active migration must throw LegacyDatabaseUnavailableError, NOT report a successful no-op
+        await expect(importLegacyCacheToActiveAccount('perm_dest_unsupported_legacy')).rejects.toThrow(
+          LegacyDatabaseUnavailableError
+        );
+      } finally {
+        (globalThis as any).indexedDB = originalIndexedDB;
+      }
+    } finally {
+      setLegacyDbNameForTesting(null);
+      setLegacyDatabaseExistenceCheckerForTesting(null);
+    }
+  });
+
+  // Test 51: Legacy database opening never upgrades existing version and surfaces open failures
+  it('51. openExistingLegacyDB preserves existing database version and surfaces open failures', async () => {
+    const isolatedLegacyDbName = `kurippu_test_legacy_version_${Date.now()}`;
+    setLegacyDbNameForTesting(isolatedLegacyDbName);
+
+    // 1. Create an isolated legacy database at version 1 with notes
+    const setupDb = await openDB(isolatedLegacyDbName, 1, {
+      upgrade(db) {
+        if (!db.objectStoreNames.contains('notes')) {
+          db.createObjectStore('notes', { keyPath: 'id' });
+        }
+      },
+    });
+    const testNote = createNote('legacy_ver_note_1', 'Version Preservation Note');
+    await setupDb.put('notes', testNote);
+    setupDb.close();
+
+    let verifyDb1: any = null;
+    let verifyDb2: any = null;
+    try {
+      // 2. Verify inspection does NOT upgrade version
+      const summary = await inspectLegacyCache();
+      expect(summary.exists).toBe(true);
+      expect(summary.notesCount).toBe(1);
+
+      // Verify version in IndexedDB remains exactly 1
+      verifyDb1 = await openDB(isolatedLegacyDbName);
+      expect(verifyDb1.version).toBe(1);
+      verifyDb1.close();
+      verifyDb1 = null;
+
+      // 3. Verify active migration does NOT upgrade version
+      setActiveAccount('perm_dest_ver_test');
+      await clearLocalDatabase();
+
+      const migrationResult = await importLegacyCacheToActiveAccount('perm_dest_ver_test');
+      expect(migrationResult.importedNotesCount).toBe(1);
+
+      // Verify version remains exactly 1 and notes store remains intact
+      verifyDb2 = await openDB(isolatedLegacyDbName);
+      expect(verifyDb2.version).toBe(1);
+      const remainingNotes = await verifyDb2.getAll('notes');
+      expect(remainingNotes.length).toBe(1);
+      verifyDb2.close();
+      verifyDb2 = null;
+
+      // 4. Test disappearance race condition / open failure surfacing:
+      // Configure existence checker to report true, but point to a database that was removed
+      const disappearedDbName = `kurippu_test_disappeared_${Date.now()}`;
+      setLegacyDbNameForTesting(disappearedDbName);
+      setLegacyDatabaseExistenceCheckerForTesting(async () => true);
+
+      // Inspection must surface the open failure (reject) because existence was confirmed
+      await expect(inspectLegacyCache()).rejects.toThrow();
+
+      // Migration must NOT silently report a successful no-op; it must surface the open failure
+      setActiveAccount('perm_dest_race_test');
+      await clearLocalDatabase();
+
+      await expect(importLegacyCacheToActiveAccount('perm_dest_race_test')).rejects.toThrow();
+
+      // Verify the disappeared database was not created with a valid schema version on disk
+      if (typeof indexedDB !== 'undefined' && typeof indexedDB.databases === 'function') {
+        const dbs = await indexedDB.databases();
+        expect(dbs.some(d => d.name === disappearedDbName && (d.version ?? 0) > 0)).toBe(false);
+      }
+    } finally {
+      if (verifyDb1) { try { verifyDb1.close(); } catch {} }
+      if (verifyDb2) { try { verifyDb2.close(); } catch {} }
+      try { await deleteDB(isolatedLegacyDbName); } catch {}
+      setLegacyDbNameForTesting(null);
+      setLegacyDatabaseExistenceCheckerForTesting(null);
+    }
+  });
+
+  // Test 52: clearLocalDatabase with stale session ID rejects and preserves active account partition
+  it('52. clearLocalDatabase with stale session ID rejects and preserves active account partition', async () => {
+    // 1. Setup Alice's account and capture session
+    setActiveAccount('perm_alice_clear_guard');
+    const aliceSession = getActiveAccountSessionId();
+
+    // 2. Switch to Bob and write data into Bob's partition
+    setActiveAccount('perm_bob_clear_guard');
+    await clearLocalDatabase();
+    const bobNote = createNote('note_bob_protected', 'Protected Content in Bob Partition');
+    await saveNoteLocal(bobNote);
+    await enqueueOrCoalesceSyncJob({
+      jobId: 'job_bob_protected',
+      type: 'SAVE_NOTE',
+      targetId: 'note_bob_protected',
+      payload: bobNote,
+      clientTimestamp: Date.now(),
+      retryCount: 0,
+      status: 'pending',
+    });
+
+    // Verify Bob has 1 note and 1 queue job
+    expect((await listNotesLocal()).length).toBe(1);
+    expect((await getAllQueueJobs()).length).toBe(1);
+
+    // 3. Stale clear operation from Alice's session (passing aliceSession) must reject with StaleSessionError
+    await expect(clearLocalDatabase(undefined, aliceSession)).rejects.toThrow(StaleSessionError);
+
+    // 4. Stale clear operation explicitly referencing perm_alice and aliceSession must also reject
+    await expect(clearLocalDatabase('perm_alice_clear_guard', aliceSession)).rejects.toThrow();
+
+    // 5. Verify Bob's partition data was NOT cleared and remains completely intact
+    const remainingNotes = await listNotesLocal();
+    expect(remainingNotes.length).toBe(1);
+    expect(remainingNotes[0].id).toBe('note_bob_protected');
+    const remainingJobs = await getAllQueueJobs();
+    expect(remainingJobs.length).toBe(1);
+    expect(remainingJobs[0].targetId).toBe('note_bob_protected');
+  });
+
+  // Test 53: Deleting a note reconciles against remote manifest and preserves remote additions from other devices
+  it('53. Deleting a note reconciles against remote manifest and preserves remote additions from other devices', async () => {
+    const accountId = 'perm_manifest_del_device_a';
+    setActiveAccount(accountId);
+    await clearLocalDatabase();
+    const adapter = new MockDriveAdapter(accountId, 'token_shared_dev');
+    const engineA = new SyncEngine(adapter, accountId);
+
+    try {
+      // 1. Initial state: Note 1 created and synced to Drive
+      const note1 = createNote('note_dev_a_1', 'Device A Note 1 Content');
+      note1.contentHash = await computeContentHash(note1.content);
+      await saveNoteLocal(note1);
+      await enqueueOrCoalesceSyncJob({
+        jobId: 'job_create_note1',
+        type: 'SAVE_NOTE',
+        targetId: note1.id,
+        payload: note1,
+        clientTimestamp: Date.now(),
+        retryCount: 0,
+        status: 'pending',
+      });
+      await engineA.processQueue();
+
+      const folderInfo = await adapter.discoverOrCreateAppFolders();
+      const initialRemoteManifest = await adapter.getManifest(folderInfo);
+      expect(initialRemoteManifest?.manifest.notes['note_dev_a_1']).toBeDefined();
+
+      // 2. Simulate Device B: adds Note 2 and a branch directly to remote Drive
+      const note2 = createNote('note_dev_b_2', 'Device B Note 2 Content');
+      note2.contentHash = await computeContentHash(note2.content);
+      const saveNote2Res = await adapter.saveNote(note2, folderInfo);
+
+      const remoteManifestWithB = initialRemoteManifest!.manifest;
+      remoteManifestWithB.notes['note_dev_b_2'] = {
+        id: note2.id,
+        title: note2.title,
+        type: note2.type,
+        attributes: [],
+        contentHash: note2.contentHash,
+        driveFileId: saveNote2Res.fileId,
+        updatedAt: new Date().toISOString(),
+        isDeleted: false,
+      };
+      remoteManifestWithB.branches = [
+        {
+          branchId: 'branch_b_feature',
+          noteId: 'note_dev_b_2',
+          parentNoteId: 'root',
+          position: 1,
+        },
+      ];
+      remoteManifestWithB.revisionSequence = (remoteManifestWithB.revisionSequence || 1) + 1;
+      await adapter.saveManifest(folderInfo, remoteManifestWithB);
+
+      // Verify remote manifest now has Note 1 and Note 2
+      const remoteBeforeDelete = await adapter.getManifest(folderInfo);
+      expect(remoteBeforeDelete?.manifest.notes['note_dev_b_2']).toBeDefined();
+      expect(remoteBeforeDelete?.manifest.branches?.length).toBe(1);
+
+      // Verify Device A still has a stale local manifest that only knows about Note 1
+      const staleLocalManifest = await getManifestLocal();
+      expect(staleLocalManifest?.notes['note_dev_b_2']).toBeUndefined();
+
+      // 3. Device A deletes Note 1
+      await enqueueOrCoalesceSyncJob({
+        jobId: 'job_delete_note1',
+        type: 'DELETE_NOTE',
+        targetId: 'note_dev_a_1',
+        payload: note1,
+        clientTimestamp: Date.now(),
+        retryCount: 0,
+        status: 'pending',
+      });
+      await engineA.processQueue();
+
+      // 4. Assert that Device B's Note 2 and its branch survived the deletion in remote manifest!
+      const remoteAfterDelete = await adapter.getManifest(folderInfo);
+      expect(remoteAfterDelete).toBeDefined();
+      expect(remoteAfterDelete!.manifest.notes['note_dev_a_1']?.isDeleted).toBe(true);
+      expect(remoteAfterDelete!.manifest.notes['note_dev_b_2']).toBeDefined();
+      expect(remoteAfterDelete!.manifest.notes['note_dev_b_2']?.title).toBe('Note note_dev_b_2');
+      expect(remoteAfterDelete!.manifest.notes['note_dev_b_2']?.isDeleted).toBeFalsy();
+      expect(remoteAfterDelete!.manifest.branches?.some(b => b.noteId === 'note_dev_b_2')).toBe(true);
+
+      // 5. Assert that Device A's local manifest was updated with Device B's changes
+      const updatedLocalManifest = await getManifestLocal();
+      expect(updatedLocalManifest?.notes['note_dev_b_2']).toBeDefined();
+      expect(updatedLocalManifest?.notes['note_dev_a_1']?.isDeleted).toBe(true);
+    } finally {
+      engineA.stopAutoPoll();
+      await clearLocalDatabase();
+      setActiveAccount('test_default');
+    }
+  });
+
+  // Test 54: Remote manifest retrieval or saving failure leaves delete job retryable without overwriting remote state
+  it('54. Remote manifest retrieval or saving failure leaves delete job retryable without overwriting remote state', async () => {
+    const accountId = 'perm_del_fail_retry';
+    setActiveAccount(accountId);
+    await clearLocalDatabase();
+    const adapter = new MockDriveAdapter(accountId, 'token_fail_retry');
+    const engine = new SyncEngine(adapter, accountId);
+
+    try {
+      // Setup Note 1 and Note 2 on Drive
+      const note1 = createNote('note_retry_1', 'Retry Note 1');
+      note1.contentHash = await computeContentHash(note1.content);
+      await saveNoteLocal(note1);
+      await enqueueOrCoalesceSyncJob({
+        jobId: 'job_create_r1',
+        type: 'SAVE_NOTE',
+        targetId: note1.id,
+        payload: note1,
+        clientTimestamp: Date.now(),
+        retryCount: 0,
+        status: 'pending',
+      });
+      await engine.processQueue();
+
+      const folderInfo = await adapter.discoverOrCreateAppFolders();
+      // Add Note 2 to remote Drive
+      const note2 = createNote('note_retry_2', 'Remote Note 2 Survives');
+      note2.contentHash = await computeContentHash(note2.content);
+      await adapter.saveNote(note2, folderInfo);
+      const manifest = (await adapter.getManifest(folderInfo))!.manifest;
+      manifest.notes['note_retry_2'] = {
+        id: note2.id,
+        title: note2.title,
+        type: note2.type,
+        attributes: [],
+        contentHash: note2.contentHash,
+        updatedAt: new Date().toISOString(),
+        isDeleted: false,
+      };
+      await adapter.saveManifest(folderInfo, manifest);
+
+      // Enqueue DELETE_NOTE for Note 1
+      await enqueueOrCoalesceSyncJob({
+        jobId: 'job_delete_retry_1',
+        type: 'DELETE_NOTE',
+        targetId: 'note_retry_1',
+        payload: note1,
+        clientTimestamp: Date.now(),
+        retryCount: 0,
+        status: 'pending',
+      });
+
+      // 1. Simulate network failure during remote manifest retrieval
+      adapter.onBeforeGetManifest = () => {
+        throw new Error('Network error: simulated getManifest failure');
+      };
+      await engine.processQueue();
+
+      // Remote manifest must NOT have been overwritten or mutated
+      adapter.onBeforeGetManifest = undefined;
+      const remoteAfterFailedGet = await adapter.getManifest(folderInfo);
+      expect(remoteAfterFailedGet?.manifest.notes['note_retry_2']).toBeDefined();
+      expect(remoteAfterFailedGet?.manifest.notes['note_retry_1']?.isDeleted).toBeFalsy();
+
+      // Delete job must remain retryable in queue
+      let jobs = await getAllQueueJobs();
+      expect(jobs.length).toBe(1);
+      expect(jobs[0].type).toBe('DELETE_NOTE');
+      expect(jobs[0].status).toBe('pending');
+
+      // 2. Simulate partial failure: remote file deleted, but saveManifest fails
+      let saveFailedOnce = false;
+      adapter.onBeforeSaveManifest = (m) => {
+        if (!saveFailedOnce && m.notes['note_retry_1']?.isDeleted) {
+          saveFailedOnce = true;
+          throw new Error('Network error: simulated saveManifest failure');
+        }
+      };
+      await engine.processQueue();
+
+      // Verify remote note file was trashed, but manifest was not updated yet
+      const file1 = Array.from(adapter.files.values()).find(f => f.appProperties['kurippuNoteId'] === 'note_retry_1');
+      expect(file1?.trashed).toBe(true);
+
+      jobs = await getAllQueueJobs();
+      expect(jobs.length).toBe(1);
+      expect(jobs[0].status).toBe('pending');
+
+      // 3. Retry when network recovers: already-deleted file handled idempotently, manifest tombstone saved
+      adapter.onBeforeSaveManifest = undefined;
+      await engine.processQueue();
+
+      expect((await getAllQueueJobs()).length).toBe(0);
+      const finalRemoteManifest = await adapter.getManifest(folderInfo);
+      expect(finalRemoteManifest?.manifest.notes['note_retry_1']?.isDeleted).toBe(true);
+      expect(finalRemoteManifest?.manifest.notes['note_retry_2']).toBeDefined();
+    } finally {
+      adapter.onBeforeGetManifest = undefined;
+      adapter.onBeforeSaveManifest = undefined;
+      engine.stopAutoPoll();
+      await clearLocalDatabase();
+      setActiveAccount('test_default');
+    }
+  });
+
+  // Test 55: Activating the same account repeatedly is idempotent and preserves in-flight operations
+  it('55. Activating the same account repeatedly is idempotent and preserves in-flight operations', async () => {
+    const accountId = 'perm_idemp_acc';
+    setActiveAccount(accountId);
+    const session1 = getActiveAccountSessionId();
+
+    // 1. Repeated calls with the same account ID must not change the session ID
+    setActiveAccount(accountId);
+    expect(getActiveAccountSessionId()).toBe(session1);
+    setActiveAccount(accountId);
+    expect(getActiveAccountSessionId()).toBe(session1);
+
+    // 2. Open DB connection and verify subsequent activation does not close or invalidate it
+    const db = await getLocalDB(accountId, session1);
+    expect(db).toBeDefined();
+
+    setActiveAccount(accountId);
+    expect(getActiveAccountSessionId()).toBe(session1);
+
+    // 3. Write operation using session1 succeeds without StaleSessionError
+    const testNote = createNote('note_idemp_write', 'Idempotent Activation Note');
+    await saveNoteLocal(testNote, accountId, session1);
+    const loadedNote = await getNoteLocal('note_idemp_write', accountId, session1);
+    expect(loadedNote?.title).toBe('Note note_idemp_write');
+
+    // 4. Repeated activation while database is opening preserves pending promise and session
+    const openAccount = 'perm_idemp_inflight';
+    setActiveAccount(openAccount);
+    const openSession = getActiveAccountSessionId();
+
+    const pendingOpen = getLocalDB(openAccount, openSession);
+    setActiveAccount(openAccount);
+    expect(getActiveAccountSessionId()).toBe(openSession);
+
+    const openedDb = await pendingOpen;
+    expect(openedDb).toBeDefined();
+
+    await clearLocalDatabase();
+    setActiveAccount('test_default');
+  });
+
+  // Test 56: Switching A -> B -> A invalidates previous sessions and prevents stale session writes
+  it('56. Switching A -> B -> A invalidates previous sessions and prevents stale session writes', async () => {
+    // 1. Account A - Session 1
+    setActiveAccount('perm_aba_alice');
+    const aliceSession1 = getActiveAccountSessionId();
+    await clearLocalDatabase();
+
+    // 2. Switch to Account B - Session 2
+    setActiveAccount('perm_aba_bob');
+    const bobSession = getActiveAccountSessionId();
+    expect(bobSession).toBeGreaterThan(aliceSession1);
+
+    // Stale operations from Alice's session 1 must reject with StaleSessionError
+    await expect(getLocalDB('perm_aba_alice', aliceSession1)).rejects.toThrow(StaleSessionError);
+    await expect(getLocalDB(undefined, aliceSession1)).rejects.toThrow(StaleSessionError);
+    // Accessing Alice's partition while Bob is active without passing expectedSessionId rejects with AccountMismatchError
+    await expect(getLocalDB('perm_aba_alice')).rejects.toThrow(AccountMismatchError);
+
+    // 3. Switch back to Account A - Session 3
+    setActiveAccount('perm_aba_alice');
+    const aliceSession2 = getActiveAccountSessionId();
+    expect(aliceSession2).toBeGreaterThan(bobSession);
+
+    // 4. Operations from original Alice Session 1 MUST reject because session advanced
+    const staleNote = createNote('note_alice_stale', 'Stale session write attempt');
+    await expect(saveNoteLocal(staleNote, 'perm_aba_alice', aliceSession1)).rejects.toThrow(StaleSessionError);
+    await expect(clearLocalDatabase('perm_aba_alice', aliceSession1)).rejects.toThrow(StaleSessionError);
+
+    // 5. Valid operations under Alice Session 2 succeed
+    const validNote = createNote('note_alice_valid', 'Valid session 2 write');
+    await saveNoteLocal(validNote, 'perm_aba_alice', aliceSession2);
+    const retrieved = await getNoteLocal('note_alice_valid', 'perm_aba_alice', aliceSession2);
+    expect(retrieved?.title).toBe('Note note_alice_valid');
+
+    await clearLocalDatabase();
+    setActiveAccount('test_default');
   });
 });

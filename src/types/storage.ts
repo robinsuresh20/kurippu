@@ -114,6 +114,13 @@ export interface DuplicateFileRecord {
   modifiedTime?: string;
 }
 
+export interface GoogleUserProfile {
+  displayName: string;
+  emailAddress: string;
+  permissionId: string;
+  photoLink?: string;
+}
+
 export interface IStorageAdapter {
   discoverOrCreateAppFolders(): Promise<DriveFolderInfo>;
   getManifest(folderInfo: DriveFolderInfo): Promise<{ manifest: ApplicationManifest; version?: number } | null>;
@@ -122,4 +129,5 @@ export interface IStorageAdapter {
   saveNote(note: NoteDocument, folderInfo: DriveFolderInfo): Promise<{ fileId: string; version: number; contentHash: string }>;
   listDriveNotes(folderInfo: DriveFolderInfo): Promise<{ fileId: string; name: string; appProperties?: Record<string, string>; version?: number; modifiedTime?: string }[]>;
   deleteNoteFile(fileId: string): Promise<void>;
+  getUserProfile?(): Promise<GoogleUserProfile>;
 }
