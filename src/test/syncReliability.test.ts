@@ -4050,4 +4050,297 @@ describe('Google Drive Sync Reliability & Idempotency Tests', () => {
     await clearLocalDatabase();
     setActiveAccount('test_default');
   });
+
+  // Test 57: All 15 legacy notes already exist in target partition -> inspectLegacyCache reports allAlreadyImported: true
+  it('57. All 15 legacy notes already exist in target partition -> inspectLegacyCache reports allAlreadyImported: true', async () => {
+    const testLegacyDbName = `kurippu_test_legacy_57_${Date.now()}`;
+    setLegacyDbNameForTesting(testLegacyDbName);
+    const targetAccountId = 'perm_legacy_all_exist';
+
+    try {
+      // 1. Setup isolated legacy database with 15 notes
+      const legacyDb = await openLegacyDatabase(testLegacyDbName);
+      const notesToCreate: NoteDocument[] = [];
+      for (let i = 1; i <= 15; i++) {
+        const n = createNote(`legacy_57_note_${i}`, `Content ${i}`);
+        notesToCreate.push(n);
+        await legacyDb.put('notes', n);
+      }
+      legacyDb.close();
+
+      // 2. Setup target partition with all 15 notes already existing
+      setActiveAccount(targetAccountId);
+      await clearLocalDatabase();
+      for (const n of notesToCreate) {
+        await saveNoteLocal(n, targetAccountId);
+      }
+      expect((await listNotesLocal()).length).toBe(15);
+
+      // 3. inspectLegacyCache must recognize that all notes already exist
+      const summary = await inspectLegacyCache(targetAccountId);
+      expect(summary.exists).toBe(true);
+      expect(summary.notesCount).toBe(15);
+      expect(summary.unimportedNotesCount).toBe(0);
+      expect(summary.unhandledJobsCount).toBe(0);
+      expect(summary.allAlreadyImported).toBe(true);
+
+      // 4. Running import skips all 15 notes accurately
+      const res = await importLegacyCacheToActiveAccount(targetAccountId);
+      expect(res.importedNotesCount).toBe(0);
+      expect(res.skippedNotesCount).toBe(15);
+      expect(res.importedJobsCount).toBe(0);
+
+      // 5. Re-inspect confirms allAlreadyImported remains true
+      const summaryAfter = await inspectLegacyCache(targetAccountId);
+      expect(summaryAfter.allAlreadyImported).toBe(true);
+    } finally {
+      await clearLocalDatabase();
+      setLegacyDbNameForTesting(null);
+      try { await deleteDB(testLegacyDbName); } catch {}
+      setActiveAccount('test_default');
+    }
+  });
+
+  // Test 58: Partially missing legacy notes -> inspectLegacyCache reports unimported count, import only imports missing notes
+  it('58. Partially missing legacy notes -> inspectLegacyCache reports unimported count, import only imports missing notes', async () => {
+    const testLegacyDbName = `kurippu_test_legacy_58_${Date.now()}`;
+    setLegacyDbNameForTesting(testLegacyDbName);
+    const targetAccountId = 'perm_legacy_partial';
+
+    try {
+      // 1. Setup isolated legacy database with 15 notes
+      const legacyDb = await openLegacyDatabase(testLegacyDbName);
+      const all15Notes: NoteDocument[] = [];
+      for (let i = 1; i <= 15; i++) {
+        const n = createNote(`legacy_58_note_${i}`, `Content ${i}`);
+        all15Notes.push(n);
+        await legacyDb.put('notes', n);
+      }
+      legacyDb.close();
+
+      // 2. Target partition only has the first 10 notes (5 missing)
+      setActiveAccount(targetAccountId);
+      await clearLocalDatabase();
+      for (let i = 0; i < 10; i++) {
+        await saveNoteLocal(all15Notes[i], targetAccountId);
+      }
+      expect((await listNotesLocal()).length).toBe(10);
+
+      // 3. inspectLegacyCache reports 5 unimported notes and allAlreadyImported === false
+      const summaryBefore = await inspectLegacyCache(targetAccountId);
+      expect(summaryBefore.exists).toBe(true);
+      expect(summaryBefore.notesCount).toBe(15);
+      expect(summaryBefore.unimportedNotesCount).toBe(5);
+      expect(summaryBefore.allAlreadyImported).toBe(false);
+
+      // 4. Import imports only the 5 missing notes and skips the 10 existing ones
+      const res = await importLegacyCacheToActiveAccount(targetAccountId);
+      expect(res.importedNotesCount).toBe(5);
+      expect(res.skippedNotesCount).toBe(10);
+      expect((await listNotesLocal()).length).toBe(15);
+
+      // 5. Re-inspection confirms 0 unimported and allAlreadyImported === true
+      const summaryAfter = await inspectLegacyCache(targetAccountId);
+      expect(summaryAfter.unimportedNotesCount).toBe(0);
+      expect(summaryAfter.allAlreadyImported).toBe(true);
+    } finally {
+      await clearLocalDatabase();
+      setLegacyDbNameForTesting(null);
+      try { await deleteDB(testLegacyDbName); } catch {}
+      setActiveAccount('test_default');
+    }
+  });
+
+  // Test 59: Account switching preserves isolation: Alice has all legacy notes, Bob has none
+  it('59. Account switching preserves isolation: Alice has all legacy notes, Bob has none', async () => {
+    const testLegacyDbName = `kurippu_test_legacy_59_${Date.now()}`;
+    setLegacyDbNameForTesting(testLegacyDbName);
+
+    try {
+      // 1. Setup isolated legacy database with 5 notes
+      const legacyDb = await openLegacyDatabase(testLegacyDbName);
+      for (let i = 1; i <= 5; i++) {
+        await legacyDb.put('notes', createNote(`legacy_59_note_${i}`, `Content ${i}`));
+      }
+      legacyDb.close();
+
+      // 2. Alice imports and has all 5 notes
+      setActiveAccount('perm_legacy_switch_alice');
+      await clearLocalDatabase();
+      await importLegacyCacheToActiveAccount('perm_legacy_switch_alice');
+      const summaryAlice = await inspectLegacyCache('perm_legacy_switch_alice');
+      expect(summaryAlice.allAlreadyImported).toBe(true);
+      expect(summaryAlice.unimportedNotesCount).toBe(0);
+
+      // 3. Switch to Bob (brand new partition with 0 notes)
+      setActiveAccount('perm_legacy_switch_bob');
+      await clearLocalDatabase();
+      const summaryBob = await inspectLegacyCache('perm_legacy_switch_bob');
+      expect(summaryBob.allAlreadyImported).toBe(false);
+      expect(summaryBob.unimportedNotesCount).toBe(5);
+
+      // 4. Switch back to Alice: Alice's handled status remains preserved
+      setActiveAccount('perm_legacy_switch_alice');
+      const summaryAlice2 = await inspectLegacyCache('perm_legacy_switch_alice');
+      expect(summaryAlice2.allAlreadyImported).toBe(true);
+    } finally {
+      setActiveAccount('perm_legacy_switch_alice');
+      await clearLocalDatabase();
+      setActiveAccount('perm_legacy_switch_bob');
+      await clearLocalDatabase();
+      setLegacyDbNameForTesting(null);
+      try { await deleteDB(testLegacyDbName); } catch {}
+      setActiveAccount('test_default');
+    }
+  });
+
+  // Test 60: Repeated refresh/inspection: consecutive calls do not mutate storage and return idempotent handled status
+  it('60. Repeated refresh/inspection: consecutive calls do not mutate storage and return idempotent handled status', async () => {
+    const testLegacyDbName = `kurippu_test_legacy_60_${Date.now()}`;
+    setLegacyDbNameForTesting(testLegacyDbName);
+    const targetAccountId = 'perm_legacy_repeated_inspect';
+
+    try {
+      // 1. Setup isolated legacy database with 3 notes
+      const legacyDb = await openLegacyDatabase(testLegacyDbName);
+      for (let i = 1; i <= 3; i++) {
+        await legacyDb.put('notes', createNote(`legacy_60_note_${i}`, `Content ${i}`));
+      }
+      legacyDb.close();
+
+      // 2. Setup target partition with all 3 notes
+      setActiveAccount(targetAccountId);
+      await clearLocalDatabase();
+      await importLegacyCacheToActiveAccount(targetAccountId);
+
+      // 3. Consecutive inspections simulating repeated page refreshes (Ctrl+R)
+      for (let i = 0; i < 5; i++) {
+        const summary = await inspectLegacyCache(targetAccountId);
+        expect(summary.allAlreadyImported).toBe(true);
+        expect(summary.unimportedNotesCount).toBe(0);
+        expect(summary.notesCount).toBe(3);
+      }
+
+      // Verify neither legacy DB nor target DB was mutated
+      expect((await listNotesLocal()).length).toBe(3);
+    } finally {
+      await clearLocalDatabase();
+      setLegacyDbNameForTesting(null);
+      try { await deleteDB(testLegacyDbName); } catch {}
+      setActiveAccount('test_default');
+    }
+  });
+
+  // Test 61: Unsupported legacy job types are non-actionable and do not prevent legacy cache from being considered handled
+  it('61. Unsupported legacy job types are non-actionable and do not prevent legacy cache from being considered handled', async () => {
+    const testLegacyDbName = `kurippu_test_legacy_61_${Date.now()}`;
+    setLegacyDbNameForTesting(testLegacyDbName);
+    const targetAccountId = 'perm_legacy_unsupported_jobs';
+
+    try {
+      // 1. Setup legacy database with 2 notes and 2 unsupported legacy jobs (DELETE_NOTE, SAVE_MANIFEST)
+      const legacyDb = await openLegacyDatabase(testLegacyDbName);
+      const n1 = createNote('legacy_61_note_1', 'Note 1');
+      const n2 = createNote('legacy_61_note_2', 'Note 2');
+      await legacyDb.put('notes', n1);
+      await legacyDb.put('notes', n2);
+      await legacyDb.put('sync_queue', {
+        id: 1,
+        jobId: 'legacy_job_unsupported_1',
+        type: 'DELETE_NOTE' as any,
+        targetId: 'legacy_61_note_1',
+        payload: n1,
+        clientTimestamp: Date.now(),
+        retryCount: 0,
+        status: 'pending',
+      });
+      await legacyDb.put('sync_queue', {
+        id: 2,
+        jobId: 'legacy_job_unsupported_2',
+        type: 'SAVE_MANIFEST' as any,
+        targetId: 'manifest',
+        payload: {},
+        clientTimestamp: Date.now(),
+        retryCount: 0,
+        status: 'pending',
+      });
+      legacyDb.close();
+
+      // 2. Target partition has both notes
+      setActiveAccount(targetAccountId);
+      await clearLocalDatabase();
+      await saveNoteLocal(n1, targetAccountId);
+      await saveNoteLocal(n2, targetAccountId);
+
+      // 3. inspectLegacyCache must report unhandledJobsCount === 0 and allAlreadyImported === true
+      // because DELETE_NOTE and SAVE_MANIFEST cannot and should not be imported
+      const summary = await inspectLegacyCache(targetAccountId);
+      expect(summary.exists).toBe(true);
+      expect(summary.notesCount).toBe(2);
+      expect(summary.unimportedNotesCount).toBe(0);
+      expect(summary.unhandledJobsCount).toBe(0);
+      expect(summary.allAlreadyImported).toBe(true);
+
+      // 4. Import skips notes and imports 0 jobs
+      const res = await importLegacyCacheToActiveAccount(targetAccountId);
+      expect(res.importedNotesCount).toBe(0);
+      expect(res.skippedNotesCount).toBe(2);
+      expect(res.importedJobsCount).toBe(0);
+      expect((await getAllQueueJobs()).length).toBe(0);
+    } finally {
+      await clearLocalDatabase();
+      setLegacyDbNameForTesting(null);
+      try { await deleteDB(testLegacyDbName); } catch {}
+      setActiveAccount('test_default');
+    }
+  });
+
+  // Test 62: Import failure preserves original legacy database intact and leaves legacy banner active for recovery
+  it('62. Import failure preserves original legacy database intact and leaves legacy banner active for recovery', async () => {
+    const testLegacyDbName = `kurippu_test_legacy_62_${Date.now()}`;
+    setLegacyDbNameForTesting(testLegacyDbName);
+    const targetAccountId = 'perm_legacy_fail_recovery';
+
+    try {
+      // 1. Setup isolated legacy database with 2 notes
+      const legacyDb = await openLegacyDatabase(testLegacyDbName);
+      await legacyDb.put('notes', createNote('legacy_62_note_1', 'Note 1'));
+      await legacyDb.put('notes', createNote('legacy_62_note_2', 'Note 2'));
+      legacyDb.close();
+
+      setActiveAccount(targetAccountId);
+      await clearLocalDatabase();
+
+      // 2. Set hook to throw failure before writing to destination
+      setMigrationBeforeWriteHookForTesting(async () => {
+        throw new Error('Simulated transaction failure during migration');
+      });
+
+      // 3. Import rejects with error
+      await expect(importLegacyCacheToActiveAccount(targetAccountId)).rejects.toThrow('Simulated transaction failure during migration');
+
+      // 4. Verify target partition was rolled back (0 notes written)
+      expect((await listNotesLocal()).length).toBe(0);
+
+      // 5. Verify source legacy database is 100% intact and unmutated
+      const verifyLegacy = await openLegacyDatabase(testLegacyDbName);
+      const remainingLegacy = await verifyLegacy.getAll('notes');
+      expect(remainingLegacy.length).toBe(2);
+      verifyLegacy.close();
+
+      // 6. inspectLegacyCache continues to report notes as unimported, keeping banner active
+      setMigrationBeforeWriteHookForTesting(null);
+      const summaryAfterFail = await inspectLegacyCache(targetAccountId);
+      expect(summaryAfterFail.exists).toBe(true);
+      expect(summaryAfterFail.unimportedNotesCount).toBe(2);
+      expect(summaryAfterFail.allAlreadyImported).toBe(false);
+    } finally {
+      setMigrationBeforeWriteHookForTesting(null);
+      await clearLocalDatabase();
+      setLegacyDbNameForTesting(null);
+      try { await deleteDB(testLegacyDbName); } catch {}
+      setActiveAccount('test_default');
+    }
+  });
+
 });

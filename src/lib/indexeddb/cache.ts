@@ -263,19 +263,28 @@ export interface LegacyCacheSummary {
   pendingJobsCount: number;
   failedJobsCount: number;
   noteTitles: string[];
+  unimportedNotesCount?: number;
+  unhandledJobsCount?: number;
+  allAlreadyImported?: boolean;
 }
 
 /**
  * Inspects the legacy shared database in readonly mode.
  * Never clears, deletes, mutates, or upgrades the legacy database.
  */
-export async function inspectLegacyCache(): Promise<LegacyCacheSummary> {
+export async function inspectLegacyCache(
+  targetAccountId?: string | null,
+  expectedSessionId?: number
+): Promise<LegacyCacheSummary> {
   const emptySummary: LegacyCacheSummary = {
     exists: false,
     notesCount: 0,
     pendingJobsCount: 0,
     failedJobsCount: 0,
     noteTitles: [],
+    unimportedNotesCount: 0,
+    unhandledJobsCount: 0,
+    allAlreadyImported: false,
   };
 
   const existence = await hasLegacyDatabase();
@@ -286,29 +295,126 @@ export async function inspectLegacyCache(): Promise<LegacyCacheSummary> {
 
   // Existence was confirmed: open existing legacy DB without version upgrade.
   // If opening fails, surface the error rather than masking it as an absent database.
+  let legacyNotes: NoteDocument[] = [];
+  let legacyJobs: SyncJob[] = [];
   const legacyDb = await openExistingLegacyDB(activeLegacyDbName);
+
   try {
     if (!legacyDb.objectStoreNames.contains('notes')) {
       return emptySummary;
     }
 
-    const notes = await legacyDb.getAll('notes');
-    const allJobs = legacyDb.objectStoreNames.contains('sync_queue')
+    legacyNotes = await legacyDb.getAll('notes');
+    legacyJobs = legacyDb.objectStoreNames.contains('sync_queue')
       ? await legacyDb.getAll('sync_queue')
       : [];
-    const pendingJobsCount = allJobs.filter(j => j.status === 'pending' || j.status === 'in_flight').length;
-    const failedJobsCount = allJobs.filter(j => j.status === 'failed').length;
-    const noteTitles = notes.map(n => n.title || 'Untitled Note');
 
+  } finally {
+    legacyDb.close();
+  }
+
+  const pendingJobsCount = legacyJobs.filter(j => j.status === 'pending' || j.status === 'in_flight').length;
+  const failedJobsCount = legacyJobs.filter(j => j.status === 'failed').length;
+  const noteTitles = legacyNotes.map(n => n.title || 'Untitled Note');
+  const exists = legacyNotes.length > 0 || legacyJobs.length > 0;
+
+  if (!exists) {
+    return emptySummary;
+  }
+
+  // Determine target account to reconcile against
+  const accountToCheck = targetAccountId !== undefined ? targetAccountId : currentAccountId;
+
+  if (!accountToCheck) {
     return {
-      exists: notes.length > 0 || allJobs.length > 0,
-      notesCount: notes.length,
+      exists: true,
+      notesCount: legacyNotes.length,
       pendingJobsCount,
       failedJobsCount,
       noteTitles,
+      unimportedNotesCount: legacyNotes.length,
+      unhandledJobsCount: pendingJobsCount,
+      allAlreadyImported: false,
     };
-  } finally {
-    legacyDb.close();
+  }
+
+  // Reconcile against target account partition
+  try {
+    const targetDb = await getLocalDB(accountToCheck, expectedSessionId);
+    let unimportedNotesCount = 0;
+    const targetNoteMap = new Map<string, NoteDocument>();
+
+    if (targetDb.objectStoreNames.contains('notes')) {
+      const targetNotes = await targetDb.getAll('notes');
+      for (const tn of targetNotes) {
+        targetNoteMap.set(tn.id, tn);
+      }
+    }
+
+    for (const note of legacyNotes) {
+      if (!targetNoteMap.has(note.id)) {
+        unimportedNotesCount++;
+      }
+    }
+
+    // Check unhandled jobs: only supported jobs (SAVE_NOTE) with status 'pending' | 'in_flight'
+    let unhandledJobsCount = 0;
+    const targetQueuedJobKeys = new Set<string>();
+    if (targetDb.objectStoreNames.contains('sync_queue')) {
+      const targetJobs = await targetDb.getAll('sync_queue');
+      for (const tj of targetJobs) {
+        if (tj.status === 'pending' || tj.status === 'in_flight' || tj.status === 'failed') {
+          targetQueuedJobKeys.add(`${tj.type}:${tj.targetId}`);
+        }
+      }
+    }
+
+    for (const job of legacyJobs) {
+      if (job.type !== 'SAVE_NOTE') {
+        // Unsupported legacy job types (e.g. DELETE_NOTE, SAVE_MANIFEST) are non-actionable
+        continue;
+      }
+      if (job.status !== 'pending' && job.status !== 'in_flight') {
+        continue;
+      }
+      const jobKey = `${job.type}:${job.targetId}`;
+      if (targetQueuedJobKeys.has(jobKey)) {
+        // Already represented in target sync queue
+        continue;
+      }
+      const targetNote = targetNoteMap.get(job.targetId);
+      if (targetNote && targetNote.driveFileId) {
+        // Note is already synchronized to Google Drive in target partition
+        continue;
+      }
+      unhandledJobsCount++;
+    }
+
+    const allAlreadyImported = unimportedNotesCount === 0 && unhandledJobsCount === 0 && exists;
+
+    return {
+      exists: true,
+      notesCount: legacyNotes.length,
+      pendingJobsCount,
+      failedJobsCount,
+      noteTitles,
+      unimportedNotesCount,
+      unhandledJobsCount,
+      allAlreadyImported,
+    };
+  } catch {
+    // If target partition could not be inspected (e.g. session invalidated or account switched),
+    // report raw legacy counts safely without marking allAlreadyImported.
+    return {
+      exists: true,
+      notesCount: legacyNotes.length,
+      pendingJobsCount,
+      failedJobsCount,
+      noteTitles,
+      unimportedNotesCount: legacyNotes.length,
+      unhandledJobsCount: pendingJobsCount,
+      allAlreadyImported: false,
+    };
   }
 }
 

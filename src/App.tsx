@@ -61,6 +61,7 @@ export interface LegacyImportWorkflowParams {
   setLegacyCacheInfo: (info: LegacyCacheSummary | null) => void;
   setIsMigratingLegacy: (loading: boolean) => void;
   addLog?: (msg: string) => void;
+  inspectLegacyCache?: (accountId?: string | null, sessionId?: number) => Promise<LegacyCacheSummary>;
 }
 
 /**
@@ -96,7 +97,13 @@ export async function executeLegacyImportWorkflow(params: LegacyImportWorkflowPa
       return false;
     }
 
-    addLog(`Legacy import complete: ${res.importedNotesCount} notes and ${res.importedJobsCount} jobs imported.`);
+    if (res.skippedNotesCount > 0) {
+      addLog(
+        `Legacy import complete: ${res.importedNotesCount} imported, ${res.skippedNotesCount} already in account (skipped), ${res.importedJobsCount} jobs imported.`
+      );
+    } else {
+      addLog(`Legacy import complete: ${res.importedNotesCount} notes and ${res.importedJobsCount} jobs imported.`);
+    }
     setLegacyCacheInfo(null);
 
     await refreshLocalData();
@@ -105,6 +112,20 @@ export async function executeLegacyImportWorkflow(params: LegacyImportWorkflowPa
     }
 
     await processQueue();
+
+    const inspectFn = params.inspectLegacyCache || inspectLegacyCache;
+    try {
+      const updatedSummary = await inspectFn(targetAccountId, migrationSessionId);
+      if (getActiveAccountId() === targetAccountId && getActiveAccountSessionId() === migrationSessionId) {
+        if (updatedSummary.exists && !updatedSummary.allAlreadyImported) {
+          setLegacyCacheInfo(updatedSummary);
+        } else {
+          setLegacyCacheInfo(null);
+        }
+      }
+    } catch {
+      setLegacyCacheInfo(null);
+    }
     return true;
   } catch (err: any) {
     if (
@@ -216,8 +237,9 @@ export const App: React.FC = () => {
         addLog(`Storage Target: Live Google Drive (${user.email} - Partition: ${user.sub})`);
         refreshLocalData();
 
-        inspectLegacyCache().then(summary => {
-          if (summary.exists) setLegacyCacheInfo(summary);
+        inspectLegacyCache(user.sub).then(summary => {
+          if (summary.exists && !summary.allAlreadyImported) setLegacyCacheInfo(summary);
+          else setLegacyCacheInfo(null);
         }).catch(() => {});
       } else {
         setActiveAccount(null);
@@ -401,9 +423,11 @@ export const App: React.FC = () => {
 
         // 5. Inspect if unassigned legacy data exists in kurippu_local_cache
         try {
-          const legacySummary = await inspectLegacyCache();
-          if (legacySummary.exists) {
+          const legacySummary = await inspectLegacyCache(profile.permissionId);
+          if (legacySummary.exists && !legacySummary.allAlreadyImported) {
             setLegacyCacheInfo(legacySummary);
+          } else {
+            setLegacyCacheInfo(null);
           }
         } catch (e) {
           console.warn('[App] Error inspecting legacy cache:', e);
@@ -481,6 +505,7 @@ export const App: React.FC = () => {
       setLegacyCacheInfo,
       setIsMigratingLegacy,
       addLog,
+      inspectLegacyCache,
     });
   };
 
@@ -749,13 +774,22 @@ export const App: React.FC = () => {
       </header>
 
       {/* Legacy Data Isolation & Recovery Banner */}
-      {legacyCacheInfo && legacyCacheInfo.exists && (
+      {legacyCacheInfo && legacyCacheInfo.exists && !legacyCacheInfo.allAlreadyImported && (
         <div className="bg-amber-950/40 border-b border-amber-800/60 px-6 py-3 flex items-center justify-between text-xs text-amber-200">
           <div className="flex items-center gap-2">
             <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
             <div>
               <span className="font-semibold">Unassigned Legacy Cache Detected:</span>{' '}
-              {legacyCacheInfo.notesCount} note(s), {legacyCacheInfo.pendingJobsCount} pending job(s) found in <code>kurippu_local_cache</code> from before account isolation.
+              {legacyCacheInfo.unimportedNotesCount !== undefined && legacyCacheInfo.unimportedNotesCount < legacyCacheInfo.notesCount ? (
+                <>
+                  {legacyCacheInfo.unimportedNotesCount} unimported of {legacyCacheInfo.notesCount} note(s)
+                  {legacyCacheInfo.pendingJobsCount > 0 ? `, ${legacyCacheInfo.pendingJobsCount} pending job(s)` : ''} found in <code>kurippu_local_cache</code>.
+                </>
+              ) : (
+                <>
+                  {legacyCacheInfo.notesCount} note(s), {legacyCacheInfo.pendingJobsCount} pending job(s) found in <code>kurippu_local_cache</code> from before account isolation.
+                </>
+              )}
               Preserved safely and unassigned.
             </div>
           </div>
